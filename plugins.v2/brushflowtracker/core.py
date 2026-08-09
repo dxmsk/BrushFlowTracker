@@ -248,12 +248,10 @@ def torrent_tags(torrent: Dict[str, Any]) -> List[str]:
 
 
 def first_cleanup_rule(
-    torrent: Dict[str, Any], rules: Iterable[Dict[str, Any]], site_tag: str
+    torrent: Dict[str, Any], rules: Iterable[Dict[str, Any]]
 ) -> Optional[Dict[str, Any]]:
     """按配置顺序返回首条同时满足标签和阈值的删种规则。"""
     tags = set(torrent_tags(torrent))
-    if site_tag not in tags:
-        return None
     ratio = float(_number(torrent.get("ratio"), 0) or 0)
     seeding_time = float(_number(torrent.get("seeding_time"), 0) or 0)
     for rule in rules:

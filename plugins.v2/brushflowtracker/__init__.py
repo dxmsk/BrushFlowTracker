@@ -37,14 +37,13 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
     plugin_order = 22
     auth_level = 2
 
-    GLOBAL_TAG = "刷流追新"
     STATE_KEY = "runtime_state"
 
     def init_plugin(self, config: dict = None) -> None:
@@ -245,7 +244,7 @@ class BrushFlowTracker(_PluginBase):
             service, error = self._qb_service()
             if error:
                 raise RuntimeError(error)
-            torrents, failed = service.instance.get_torrents(tags=self.GLOBAL_TAG)
+            torrents, failed = service.instance.get_torrents()
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
             torrent_map = {str(item.get("hash") or "").lower(): item for item in torrents or []}
@@ -291,20 +290,22 @@ class BrushFlowTracker(_PluginBase):
             service, error = self._qb_service()
             if error:
                 raise RuntimeError(error)
-            torrents, failed = service.instance.get_torrents(tags=self.GLOBAL_TAG)
+            torrents, failed = service.instance.get_torrents()
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
             for site in self._target_sites(site_id):
                 rules = site.get("cleanup_rules") or []
                 if not rules:
                     continue
-                site_tag = self._site_tag(site["id"])
                 for torrent in torrents or []:
-                    rule = first_cleanup_rule(torrent, rules, site_tag)
+                    torrent_hash = str(torrent.get("hash") or "").lower()
+                    managed = self._state["managed"].get(torrent_hash)
+                    if not managed or managed.get("site_id") != site["id"]:
+                        continue
+                    rule = first_cleanup_rule(torrent, rules)
                     if not rule:
                         continue
                     result["matched"] += 1
-                    torrent_hash = str(torrent.get("hash") or "")
                     if service.instance.delete_torrents(ids=[torrent_hash], delete_file=bool(rule.get("delete_files"))):
                         result["deleted"] += 1
                         reason = f"命中删种规则：{rule.get('name')}"
@@ -345,22 +346,32 @@ class BrushFlowTracker(_PluginBase):
                     matched, reason = match_rule(item, rule, now)
                     if not matched:
                         result[f"filtered:{reason}"] += 1
+                        self._log_selection(site, rule, item, "排除", reason)
                         continue
                     candidates.append(item)
                 result["matched"] += len(candidates)
                 if self._highest_resolution_dedup and not rule.get("resolutions"):
-                    candidates = choose_highest(candidates)
+                    highest_candidates = choose_highest(candidates)
+                    selected_urls = {item["enclosure"] for item in highest_candidates}
+                    for item in candidates:
+                        if item["enclosure"] not in selected_urls:
+                            result["lower_resolution"] += 1
+                            self._log_selection(site, rule, item, "排除", "同批已有同影视的更高或同等优先版本")
+                    candidates = highest_candidates
                 for item in candidates:
                     url_key = hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
                     if url_key in self._state["processed_urls"]:
                         result["duplicate"] += 1
+                        self._log_selection(site, rule, item, "排除", "下载链接已处理")
                         continue
                     if self._highest_resolution_dedup and not rule.get("resolutions"):
                         if not dedup_allows(item, self._state["dedup_records"]):
                             result["lower_resolution"] += 1
+                            self._log_selection(site, rule, item, "排除", "不高于已下载画质")
                             continue
                     if self._add_item(site, rule, item, service):
                         result["added"] += 1
+                        self._log_selection(site, rule, item, "添加", "符合全部条件")
                         self._state["processed_urls"][url_key] = isoformat(now)
                         if self._highest_resolution_dedup and not rule.get("resolutions"):
                             self._state["dedup_records"][item["media_key"]] = {
@@ -371,6 +382,7 @@ class BrushFlowTracker(_PluginBase):
                             }
                     else:
                         result["add_failed"] += 1
+                        self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
             except Exception as err:
                 result["rule_errors"] += 1
                 logger.error(f"刷流追新站点 [{site['name']}] 规则 [{rule.get('name')}] 失败：{str(err)}")
@@ -378,13 +390,14 @@ class BrushFlowTracker(_PluginBase):
         return result
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
-        tags = [self.GLOBAL_TAG, self._site_tag(site["id"]), *split_terms(rule.get("tags"))]
-        success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=tags)
+        task_name = str(rule.get("name") or "RSS 任务").strip()
+        tags = [task_name]
+        success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
             return False
         hashes = [str(value).lower() for value in torrent_ids or [] if value]
         if not hashes:
-            hashes = self._find_added_hashes(service, site["id"], item["title"])
+            hashes = self._find_added_hashes(service, task_name, item["title"])
         now = datetime.now().astimezone()
         record = {
             "site_id": site["id"],
@@ -406,8 +419,28 @@ class BrushFlowTracker(_PluginBase):
         logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
         return True
 
-    def _find_added_hashes(self, service: Any, site_id: str, title: str) -> List[str]:
-        torrents, failed = service.instance.get_torrents(tags=self._site_tag(site_id))
+    @staticmethod
+    def _log_selection(
+        site: Dict[str, Any],
+        rule: Dict[str, Any],
+        item: Dict[str, Any],
+        outcome: str,
+        reason: str,
+    ) -> None:
+        """记录每个 RSS 条目的最终筛选结果、名称和下载链接。"""
+        clean = lambda value: str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+        logger.info(
+            "刷流追新选种 | "
+            f"站点={clean(site.get('name'))} | "
+            f"任务={clean(rule.get('name'))} | "
+            f"结果={clean(outcome)} | "
+            f"原因={clean(reason)} | "
+            f"名称={clean(item.get('title'))} | "
+            f"链接={clean(item.get('enclosure'))}"
+        )
+
+    def _find_added_hashes(self, service: Any, task_name: str, title: str) -> List[str]:
+        torrents, failed = service.instance.get_torrents(tags=task_name)
         if failed:
             return []
         matches = [item for item in torrents or [] if str(item.get("name") or "").strip() == title.strip()]
@@ -418,9 +451,14 @@ class BrushFlowTracker(_PluginBase):
         service, error = self._qb_service()
         if error:
             return [], error
-        torrents, failed = service.instance.get_torrents(tags=self._site_tag(site["id"]))
+        torrents, failed = service.instance.get_torrents()
         if failed:
             return [], "读取 qBittorrent 任务失败"
+        managed_hashes = {
+            torrent_hash
+            for torrent_hash, record in self._state["managed"].items()
+            if record.get("site_id") == site["id"]
+        }
         return [
             {
                 "hash": item.get("hash"),
@@ -436,6 +474,7 @@ class BrushFlowTracker(_PluginBase):
                 "free_until": (self._state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("free_until"),
             }
             for item in torrents or []
+            if str(item.get("hash") or "").lower() in managed_hashes
         ], None
 
     def _qb_service(self, downloader: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
@@ -472,10 +511,6 @@ class BrushFlowTracker(_PluginBase):
             "managed_count": sum(1 for row in self._state["managed"].values() if row.get("site_id") == site["id"]),
             "stats": stats,
         }
-
-    @classmethod
-    def _site_tag(cls, site_id: str) -> str:
-        return f"{cls.GLOBAL_TAG}-站点-{site_id[:12]}"
 
     def _archive_managed(
         self,

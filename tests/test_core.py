@@ -103,17 +103,17 @@ def test_persistent_dedup_only_allows_strict_upgrade():
 
 
 def test_cleanup_returns_first_matching_rule_in_order():
-    torrent = {"tags": "刷流追新,刷流追新-站点-site1,anime", "ratio": 2.5, "seeding_time": 10 * 3600}
+    torrent = {"tags": "追新动画,anime", "ratio": 2.5, "seeding_time": 10 * 3600}
     rules = [
         {"id": "too-early", "enabled": True, "labels": ["anime"], "min_seed_hours": 20, "min_ratio": 1},
         {"id": "first-match", "enabled": True, "labels": ["anime"], "min_seed_hours": 5, "min_ratio": 2},
         {"id": "later-match", "enabled": True, "labels": [], "min_seed_hours": 0, "min_ratio": 0},
     ]
-    matched = core.first_cleanup_rule(torrent, rules, "刷流追新-站点-site1")
+    matched = core.first_cleanup_rule(torrent, rules)
     assert matched["id"] == "first-match"
 
 
-def test_cleanup_never_matches_another_site():
-    torrent = {"tags": "刷流追新,刷流追新-站点-other", "ratio": 99, "seeding_time": 999999}
-    rules = [{"enabled": True, "labels": [], "min_seed_hours": 0, "min_ratio": 0}]
-    assert core.first_cleanup_rule(torrent, rules, "刷流追新-站点-site1") is None
+def test_cleanup_requires_configured_task_label():
+    torrent = {"tags": "其他任务", "ratio": 99, "seeding_time": 999999}
+    rules = [{"enabled": True, "labels": ["追新动画"], "min_seed_hours": 0, "min_ratio": 0}]
+    assert core.first_cleanup_rule(torrent, rules) is None

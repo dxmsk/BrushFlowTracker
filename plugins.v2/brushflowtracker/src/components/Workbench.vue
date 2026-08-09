@@ -102,9 +102,9 @@ function confirmDeleteSite() {
 
 function addRssRule() {
   selectedSite.value.rss_rules.push({
-    id: uid(), name: `RSS 规则 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
+    id: uid(), name: `RSS 任务 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
     required_keywords: [], excluded_keywords: [], resolutions: [], max_age_minutes: null,
-    min_size_gib: null, promotion: 'any', tags: [],
+    min_size_gib: null, promotion: 'any',
   })
 }
 
@@ -236,7 +236,7 @@ onMounted(() => loadStatus())
 
           <VTabs v-model="activeTab" class="tracker-tabs" show-arrows>
             <VTab value="tasks" prepend-icon="mdi-download-network-outline">任务</VTab>
-            <VTab value="rss" prepend-icon="mdi-rss">RSS 规则</VTab>
+            <VTab value="rss" prepend-icon="mdi-rss">RSS 任务</VTab>
             <VTab value="cleanup" prepend-icon="mdi-broom">删种规则</VTab>
             <VTab value="history" prepend-icon="mdi-history">记录</VTab>
             <VTab value="settings" prepend-icon="mdi-tune-variant">全局设置</VTab>
@@ -246,7 +246,7 @@ onMounted(() => loadStatus())
             <VWindowItem value="tasks">
               <div class="stats">
                 <VSheet class="stat app-surface-static"><span>托管任务</span><strong>{{ selectedSummary.managed_count || 0 }}</strong><VIcon icon="mdi-download-circle-outline" color="primary" /></VSheet>
-                <VSheet class="stat app-surface-static"><span>RSS 规则</span><strong>{{ selectedSite.rss_rules.length }}</strong><VIcon icon="mdi-rss" color="info" /></VSheet>
+                <VSheet class="stat app-surface-static"><span>RSS 任务</span><strong>{{ selectedSite.rss_rules.length }}</strong><VIcon icon="mdi-rss" color="info" /></VSheet>
                 <VSheet class="stat app-surface-static"><span>最近读取</span><strong>{{ selectedSummary.stats?.fetched || 0 }}</strong><VIcon icon="mdi-text-box-search-outline" color="warning" /></VSheet>
                 <VSheet class="stat app-surface-static"><span>最近添加</span><strong>{{ selectedSummary.stats?.added || 0 }}</strong><VIcon icon="mdi-check-circle-outline" color="success" /></VSheet>
               </div>
@@ -265,14 +265,14 @@ onMounted(() => loadStatus())
 
             <VWindowItem value="rss">
               <VSheet class="panel app-surface-static">
-                <header class="panel__head"><div><h2>RSS 选种规则</h2><p>规则未选择分辨率时才参与全局最高画质去重</p></div><VBtn color="primary" variant="tonal" prepend-icon="mdi-plus" @click="addRssRule">新增规则</VBtn></header>
-                <div v-if="!selectedSite.rss_rules.length" class="empty-state"><VIcon icon="mdi-rss-off" size="46" /><strong>尚未配置 RSS</strong><VBtn variant="tonal" @click="addRssRule">新增规则</VBtn></div>
+                <header class="panel__head"><div><h2>RSS 选种任务</h2><p>任务名会自动作为 qBittorrent 标签；未选择分辨率时参与最高画质去重</p></div><VBtn color="primary" variant="tonal" prepend-icon="mdi-plus" @click="addRssRule">新增任务</VBtn></header>
+                <div v-if="!selectedSite.rss_rules.length" class="empty-state"><VIcon icon="mdi-rss-off" size="46" /><strong>尚未配置 RSS 任务</strong><VBtn variant="tonal" @click="addRssRule">新增任务</VBtn></div>
                 <VExpansionPanels v-else multiple variant="accordion" class="rule-list">
                   <VExpansionPanel v-for="(rule, index) in selectedSite.rss_rules" :key="rule.id">
-                    <VExpansionPanelTitle><div class="rule-title"><VIcon icon="mdi-rss" color="info" /><strong>{{ rule.name || `RSS 规则 ${index + 1}` }}</strong><VChip size="x-small" :color="rule.enabled ? 'success' : 'default'" variant="tonal">{{ rule.enabled ? '启用' : '停用' }}</VChip></div></VExpansionPanelTitle>
+                    <VExpansionPanelTitle><div class="rule-title"><VIcon icon="mdi-rss" color="info" /><strong>{{ rule.name || `RSS 任务 ${index + 1}` }}</strong><VChip size="x-small" :color="rule.enabled ? 'success' : 'default'" variant="tonal">{{ rule.enabled ? '启用' : '停用' }}</VChip></div></VExpansionPanelTitle>
                     <VExpansionPanelText>
                       <div class="rule-grid">
-                        <VTextField v-model="rule.name" label="规则名称" hide-details />
+                        <VTextField v-model="rule.name" label="任务名称（同时作为标签）" :rules="[value => Boolean(String(value || '').trim()) || '任务名称不能为空', value => !String(value || '').includes(',') || '不能包含英文逗号']" hide-details="auto" />
                         <VSwitch v-model="rule.enabled" label="启用规则" hide-details color="success" inset />
                         <VTextField v-model="rule.url" class="span-2" label="RSS 订阅地址" placeholder="https://tracker.example/torrentrss.php?..." hide-details />
                         <VCombobox v-model="rule.required_keywords" label="必须包含关键词" multiple chips closable-chips hide-details />
@@ -281,7 +281,6 @@ onMounted(() => loadStatus())
                         <VSelect v-model="rule.promotion" :items="promotionOptions" label="免费期筛选" hide-details />
                         <VTextField v-model.number="rule.max_age_minutes" type="number" min="0" label="最大发种时间（分钟）" clearable hide-details />
                         <VTextField v-model.number="rule.min_size_gib" type="number" min="0" step="0.1" label="最小文件大小（GiB）" clearable hide-details />
-                        <VCombobox v-model="rule.tags" class="span-2" label="自动添加标签" multiple chips closable-chips hide-details />
                       </div>
                       <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRule(selectedSite.rss_rules, index)">删除</VBtn></div>
                     </VExpansionPanelText>
@@ -312,7 +311,7 @@ onMounted(() => loadStatus())
             </VWindowItem>
 
             <VWindowItem value="history">
-              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><strong>{{ row.title }}</strong><span>{{ row.reason || `${row.rule_name || 'RSS 规则'} · ${row.resolution || '未知画质'}` }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
+              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><strong>{{ row.title }}</strong><span>{{ row.reason || `${row.rule_name || 'RSS 任务'} · ${row.resolution || '未知画质'}` }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
             </VWindowItem>
 
             <VWindowItem value="settings">

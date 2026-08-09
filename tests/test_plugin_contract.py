@@ -41,6 +41,17 @@ class SilentLogger:
         return lambda *_args, **_kwargs: None
 
 
+class FakeDownloader:
+    """记录添加参数的 qBittorrent 服务替身。"""
+
+    def __init__(self):
+        self.added = []
+
+    def add_torrent(self, **kwargs):
+        self.added.append(kwargs)
+        return True, ["ABC123"]
+
+
 @pytest.fixture
 def plugin_module(monkeypatch):
     """注入最小 MoviePilot 模块并加载插件包。"""
@@ -148,3 +159,46 @@ def test_status_exposes_one_shared_downloader_setting(plugin_module):
     assert response.success is True
     assert response.data["settings"]["downloader"] == "main-qb"
     assert len(response.data["sites"]) == 2
+
+
+def test_task_name_is_the_only_qbittorrent_tag(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    downloader = FakeDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+    site = {"id": "site-a", "name": "站点 A"}
+    rule = {"id": "rule-a", "name": "动漫追新"}
+    item = {
+        "title": "Example S01E01 1080P",
+        "enclosure": "https://tracker.example/download/1",
+        "resolution": "1080P",
+        "promotion": "normal",
+        "free_until": None,
+    }
+    assert plugin._add_item(site, rule, item, service) is True
+    assert downloader.added[0]["tag"] == "动漫追新"
+    assert plugin._state["managed"]["abc123"]["tags"] == ["动漫追新"]
+
+
+def test_selection_log_contains_task_title_link_and_reason(plugin_module, monkeypatch):
+    messages = []
+    recorder = type("Recorder", (), {"info": lambda _self, message: messages.append(message)})()
+    monkeypatch.setattr(plugin_module, "logger", recorder)
+    plugin_module.BrushFlowTracker._log_selection(
+        {"name": "站点 A"},
+        {"name": "4K 追新"},
+        {"title": "Example 2160P", "enclosure": "https://tracker.example/download/2"},
+        "排除",
+        "命中排除关键词",
+    )
+    assert "任务=4K 追新" in messages[0]
+    assert "名称=Example 2160P" in messages[0]
+    assert "链接=https://tracker.example/download/2" in messages[0]
+    assert "原因=命中排除关键词" in messages[0]
+
+
+def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):
+    with pytest.raises(ValueError, match="任务名称不能为空"):
+        plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": " "}]}])
+    with pytest.raises(ValueError, match="任务名称不能包含英文逗号"):
+        plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": "电影,追新"}]}])

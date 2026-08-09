@@ -6,10 +6,10 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class RssRulePayload(BaseModel):
-    """单条 RSS 选种规则。"""
+    """单个可自定义名称的 RSS 选种任务。"""
 
     id: str = ""
-    name: str = "RSS 规则"
+    name: str = "RSS 任务"
     enabled: bool = True
     url: str = ""
     required_keywords: List[str] = Field(default_factory=list)
@@ -18,7 +18,17 @@ class RssRulePayload(BaseModel):
     max_age_minutes: Optional[float] = Field(default=None, ge=0)
     min_size_gib: Optional[float] = Field(default=None, ge=0)
     promotion: Literal["any", "free", "free_or_2xfree", "2xfree"] = "any"
-    tags: List[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """保证任务名可直接作为一个完整的 qBittorrent 标签。"""
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("任务名称不能为空")
+        if "," in cleaned:
+            raise ValueError("任务名称不能包含英文逗号")
+        return cleaned
 
     @field_validator("url")
     @classmethod
