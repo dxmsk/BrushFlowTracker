@@ -29,6 +29,7 @@ def test_promotion_recognizes_structured_and_text_markers():
     assert core.promotion_of({"downloadvolumefactor": 0, "uploadvolumefactor": 1}) == "free"
     assert core.promotion_of({"title": "[2X FREE] Example"}) == "2xfree"
     assert core.promotion_of({"title": "Freestyle Documentary"}) == "normal"
+    assert core.promotion_of({"labels": ["免费"], "title": "Example"}) == "free"
 
 
 def test_free_until_parses_structured_datetime():
@@ -41,6 +42,20 @@ def test_free_until_parses_remaining_duration():
     now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
     deadline = core.free_until_of({"description": "免费剩余 1天 2小时 30分钟"}, now)
     assert deadline == now + timedelta(days=1, hours=2, minutes=30)
+
+
+def test_free_remaining_time_also_marks_item_free_without_free_title_marker():
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    item = core.normalize_item(
+        {
+            "title": "[综艺] Heart Signal S09E01 Special 2160p WEB-DL",
+            "description": "免费剩余时间：23时26分",
+            "enclosure": "https://audiences.me/download.php?id=704378",
+        },
+        now,
+    )
+    assert item["promotion"] == "free"
+    assert item["free_until"] == now + timedelta(hours=23, minutes=26)
 
 
 def test_match_rule_requires_all_required_keywords():

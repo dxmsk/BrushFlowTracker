@@ -31,25 +31,25 @@ RESOLUTION_PATTERNS = (
     ("480P", re.compile(r"(?<!\d)480P(?!\d)", re.I)),
 )
 
-FREE_MARKER = re.compile(r"(?:^|[\s\[【(])(?:FREE|免费)(?:$|[\s\]】)])", re.I)
-TWO_X_MARKER = re.compile(r"(?:2\s*[xX倍].*?(?:FREE|免费)|(?:FREE|免费).*?2\s*[xX倍])", re.I)
+FREE_MARKER = re.compile(r"(?:免费|免費|free(?:\s*leech|\s*download)?)(?![a-z])", re.I)
+TWO_X_MARKER = re.compile(r"(?:2\s*[xX倍].*(?:FREE|免费|免費)|(?:FREE|免费|免費).*?2\s*[xX倍])", re.I)
 FREE_UNTIL_PATTERNS = (
     re.compile(
-        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?)[\s:：-]*"
+        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?|免費(?:截止|結束|到期)(?:時間)?)[\s:：-]*"
         r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
         re.I,
     ),
     re.compile(
-        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?)[\s:：-]*"
+        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?|免費(?:截止|結束|到期)(?:時間)?)[\s:：-]*"
         r"(\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
         re.I,
     ),
 )
 FREE_REMAINING = re.compile(
-    r"(?:free\s*(?:left|remaining)|免费剩余)[\s:：-]*"
-    r"(?:(\d+)\s*(?:天|d(?:ays?)?))?\s*"
-    r"(?:(\d+)\s*(?:小时|h(?:ours?)?))?\s*"
-    r"(?:(\d+)\s*(?:分钟|m(?:in(?:utes?)?)?))?",
+    r"(?:free\s*(?:left|remaining)|免费(?:剩余|剩餘)(?:时间|時間)?|(?:剩余|剩餘)(?:时间|時間))[\s:：-]*"
+    r"(?:(\d+)\s*(?:天|日|d(?:ays?)?))?\s*"
+    r"(?:(\d+)\s*(?:小时|小時|时|時|h(?:ours?)?))?\s*"
+    r"(?:(\d+)\s*(?:分钟|分鐘|分|m(?:in(?:utes?)?)?))?",
     re.I,
 )
 
@@ -128,10 +128,12 @@ def media_key(title: str) -> str:
 
 def promotion_of(item: Dict[str, Any]) -> str:
     """识别普通、免费和双倍上传免费促销。"""
-    download_factor = _number(item.get("downloadvolumefactor"), None)
-    upload_factor = _number(item.get("uploadvolumefactor"), None)
-    text = " ".join(str(item.get(key) or "") for key in ("title", "description", "promotion", "volume_factor"))
-    is_free = download_factor == 0 or bool(FREE_MARKER.search(text))
+    fields = list(_iter_fields(item))
+    download_factor = _field_number(fields, {"downloadvolumefactor", "downloadfactor", "downloadmultiplier", "downmultiplier"})
+    upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
+    free_flag = _field_bool(fields, {"free", "freeleech", "isfree", "isfreeleech"})
+    text = " ".join(str(value or "") for _key, value in fields)
+    is_free = download_factor == 0 or free_flag or bool(FREE_MARKER.search(text))
     is_two_x = (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text))
     if is_free and is_two_x:
         return "2xfree"
@@ -172,7 +174,14 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
     resolution, rank = detect_resolution(title)
     pubdate = parse_datetime(raw.get("pubdate") or raw.get("published"), now)
     promotion = promotion_of(raw)
-    free_until = free_until_of(raw, now) if promotion != "normal" else None
+    free_until = free_until_of(raw, now)
+    # 有些站点只在描述中输出“剩余时间”，不输出 FREE 标签或下载因子。
+    # 只要能解析出未来的免费截止时间，就应视为免费种，避免被免费规则误排除。
+    if promotion == "normal" and free_until:
+        fields = list(_iter_fields(raw))
+        upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
+        text = " ".join(str(value or "") for _key, value in fields)
+        promotion = "2xfree" if (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text)) else "free"
     enclosure = str(raw.get("enclosure") or raw.get("link") or "").strip()
     return {
         **raw,
@@ -289,3 +298,39 @@ def _number(value: Any, default: Optional[float]) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _iter_fields(value: Any, key: str = "") -> Iterable[Tuple[str, Any]]:
+    """递归展开 RSS/Rust 解析器可能返回的嵌套促销字段。"""
+    if isinstance(value, dict):
+        for name, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(name).casefold())
+            yield normalized, child
+            yield from _iter_fields(child, normalized)
+    elif isinstance(value, (list, tuple, set)):
+        for child in value:
+            yield from _iter_fields(child, key)
+    elif key:
+        yield key, value
+
+
+def _field_number(fields: Iterable[Tuple[str, Any]], names: set[str]) -> Optional[float]:
+    """从大小写、下划线和嵌套结构不稳定的字段中读取数字。"""
+    for key, value in fields:
+        if key in names:
+            number = _number(value, None)
+            if number is not None:
+                return number
+    return None
+
+
+def _field_bool(fields: Iterable[Tuple[str, Any]], names: set[str]) -> bool:
+    """读取站点常见的 free/freeleech 布尔字段。"""
+    for key, value in fields:
+        if key not in names:
+            continue
+        if value is True or (isinstance(value, (int, float)) and value == 1):
+            return True
+        if str(value).strip().casefold() in {"true", "yes", "y", "on", "free", "免费", "免費", "1"}:
+            return True
+    return False
