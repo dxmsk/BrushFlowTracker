@@ -35,7 +35,7 @@
 
 ### 免费期
 
-插件优先读取 `freedate`、`free_until`、`free_end`、`promotion_end`，也支持从标题或描述解析“免费截止/Free until”和“免费剩余/Free remaining”。如果 RSS 只标记免费但没有截止时间，种子仍会按规则添加，日志会明确提示无法纳入到期自动删除。
+插件优先读取 `freedate`、`free_until`、`free_end`、`promotion_end`，也支持从标题或描述解析“免费截止/Free until”和“免费剩余/Free remaining”。对 Audiences/NexusPHP 等 RSS 不返回促销字段的站点，会使用 MoviePilot 已保存的站点 Cookie 读取详情页中的“免费”徽章和剩余时间（例如“剩余时间：23时53分”）。如果 RSS 与详情页都没有截止时间，种子仍会按规则添加，日志会明确提示无法纳入到期自动删除。
 
 ### 自动删种
 

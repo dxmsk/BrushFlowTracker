@@ -1,5 +1,6 @@
 """使用最小宿主替身验证 MoviePilot 插件入口契约。"""
 
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
@@ -217,6 +218,59 @@ def test_selection_log_contains_task_title_link_and_reason(plugin_module, monkey
     assert "名称=Example 2160P" in messages[0]
     assert "链接=https://tracker.example/download/2" in messages[0]
     assert "原因=命中排除关键词" in messages[0]
+
+
+def test_audiences_detail_url_can_be_recovered_from_download_link(plugin_module):
+    tracker = plugin_module.BrushFlowTracker
+    assert tracker._detail_url({"link": "https://audiences.me/details.php?id=704450&hit=1"}) == (
+        "https://audiences.me/details.php?id=704450&hit=1"
+    )
+    assert tracker._detail_url({"enclosure": "https://audiences.me/download.php?id=704450&downhash=secret"}) == (
+        "https://audiences.me/details.php?id=704450"
+    )
+
+
+def test_audiences_detail_lookup_reuses_moviepilot_cookie(plugin_module, monkeypatch):
+    captured = {}
+    db = ModuleType("app.db")
+    utils = ModuleType("app.utils")
+    site_oper = ModuleType("app.db.site_oper")
+    http = ModuleType("app.utils.http")
+
+    class FakeSiteOper:
+        def get_by_domain(self, domain):
+            captured["domain"] = domain
+            return type("Site", (), {"cookie": "uid=1; pass=secret", "ua": "MoviePilot-UA", "proxy": 0})()
+
+    class FakeRequestUtils:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def get_res(self, url):
+            captured["url"] = url
+            return type("Response", (), {"status_code": 200, "text": "<h1>[免费] 剩余时间：23时53分</h1>"})()
+
+    site_oper.SiteOper = FakeSiteOper
+    http.RequestUtils = FakeRequestUtils
+    monkeypatch.setitem(sys.modules, "app.db", db)
+    monkeypatch.setitem(sys.modules, "app.utils", utils)
+    monkeypatch.setitem(sys.modules, "app.db.site_oper", site_oper)
+    monkeypatch.setitem(sys.modules, "app.utils.http", http)
+
+    plugin = plugin_module.BrushFlowTracker()
+    plugin._request_timeout_seconds = 20
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    result = plugin._fetch_detail_promotion(
+        {"use_proxy": False},
+        {"title": "Call Me By Fire 2160p", "enclosure": "https://audiences.me/download.php?id=704450"},
+        now,
+    )
+
+    assert result["promotion"] == "free"
+    assert result["free_until"] == now + timedelta(hours=23, minutes=53)
+    assert captured["domain"] == "audiences.me"
+    assert captured["cookies"] == "uid=1; pass=secret"
+    assert captured["url"] == "https://audiences.me/details.php?id=704450"
 
 
 def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):

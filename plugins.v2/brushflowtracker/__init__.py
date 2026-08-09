@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 import threading
 import traceback
 import uuid
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from html import unescape
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from app import schemas
 from app.helper.downloader import DownloaderHelper
@@ -38,7 +41,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -62,6 +65,7 @@ class BrushFlowTracker(_PluginBase):
         self._history_limit = normalized["history_limit"]
         self._sites = normalized["sites"]
         self._config = normalized
+        self._site_auth_cache = {}
         self._rss_lock = threading.Lock()
         self._free_lock = threading.Lock()
         self._cleanup_lock = threading.Lock()
@@ -344,6 +348,17 @@ class BrushFlowTracker(_PluginBase):
                 candidates = []
                 for raw in raw_items or []:
                     item = normalize_item(raw, now)
+                    promotion_filter = rule.get("promotion")
+                    if promotion_filter in {"free", "free_or_2xfree", "2xfree"}:
+                        pre_matched, pre_reason = match_rule(item, {**rule, "promotion": "any"}, now)
+                        if not pre_matched:
+                            result[f"filtered:{pre_reason}"] += 1
+                            self._log_selection(site, rule, item, "排除", pre_reason)
+                            continue
+                        if item.get("promotion") == "normal":
+                            detail = self._fetch_detail_promotion(site, raw, now)
+                            if detail:
+                                item = normalize_item({**raw, **detail}, now)
                     matched, reason = match_rule(item, rule, now)
                     if not matched:
                         result[f"filtered:{reason}"] += 1
@@ -389,6 +404,79 @@ class BrushFlowTracker(_PluginBase):
                 logger.error(f"刷流追新站点 [{site['name']}] 规则 [{rule.get('name')}] 失败：{str(err)}")
         site_stats.update({"last_rss_at": isoformat(datetime.now().astimezone()), **dict(result)})
         return result
+
+    def _fetch_detail_promotion(self, site: Dict[str, Any], raw: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
+        """读取 NexusPHP 详情页的免费徽章与剩余时间，弥补 RSS 不返回促销字段的站点。"""
+        detail_url = self._detail_url(raw)
+        if not detail_url:
+            return None
+        try:
+            from app.db.site_oper import SiteOper
+            from app.utils.http import RequestUtils
+
+            domain = (urlsplit(detail_url).hostname or "").lower()
+            auth_cache = getattr(self, "_site_auth_cache", {})
+            if domain not in auth_cache:
+                configured = SiteOper().get_by_domain(domain) if domain else None
+                auth_cache[domain] = (
+                    getattr(configured, "cookie", None) if configured else None,
+                    getattr(configured, "ua", None) if configured else None,
+                    bool(getattr(configured, "proxy", False)) if configured else bool(site.get("use_proxy")),
+                )
+                self._site_auth_cache = auth_cache
+            cookie, ua, use_proxy = auth_cache[domain]
+            response = RequestUtils(
+                cookies=cookie,
+                ua=ua or site.get("user_agent") or None,
+                proxies=self._proxy_config() if use_proxy else None,
+                timeout=self._request_timeout_seconds,
+            ).get_res(detail_url)
+            if not response:
+                logger.warning(f"刷流追新读取详情页免费状态失败：{detail_url} 无响应，请检查站点 Cookie/网络")
+                return None
+            if getattr(response, "status_code", 200) != 200:
+                logger.warning(
+                    f"刷流追新读取详情页免费状态失败：{detail_url} HTTP {getattr(response, 'status_code', '?')}，"
+                    "请在 MoviePilot 站点管理中更新 Cookie"
+                )
+                return None
+            html = getattr(response, "text", "") or ""
+            text = unescape(re.sub(r"<[^>]+>", " ", html))
+            detail_item = {"title": raw.get("title", ""), "description": text}
+            promotion = normalize_item({**detail_item, "enclosure": raw.get("enclosure") or raw.get("link")}, now)
+            if promotion.get("promotion") == "normal":
+                return None
+            return {"promotion": promotion["promotion"], "free_until": promotion.get("free_until")}
+        except Exception as err:
+            logger.debug(f"刷流追新读取详情页免费状态失败：{detail_url}，{str(err)}")
+            return None
+
+    @staticmethod
+    def _proxy_config() -> Any:
+        """按需读取 MoviePilot 全局代理配置，避免测试环境强依赖 settings。"""
+        try:
+            from app.core.config import settings
+            return settings.PROXY
+        except Exception:
+            return None
+
+    @staticmethod
+    def _detail_url(raw: Dict[str, Any]) -> Optional[str]:
+        """优先使用 RSS 详情链接，否则将 NexusPHP download.php 链接转换为 details.php。"""
+        link = str(raw.get("link") or "").strip()
+        if link and "details.php" in link.lower():
+            return link
+        enclosure = str(raw.get("enclosure") or "").strip()
+        parts = urlsplit(link or enclosure)
+        if not parts.scheme or not parts.netloc:
+            return None
+        if "download.php" not in parts.path.lower():
+            return None
+        query = parse_qs(parts.query)
+        torrent_id = (query.get("id") or [None])[0]
+        if not torrent_id:
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, "/details.php", urlencode({"id": torrent_id}), ""))
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
         task_name = str(rule.get("name") or "RSS 任务").strip()
