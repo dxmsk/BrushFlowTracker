@@ -241,6 +241,21 @@ def test_site_uid_and_passkey_are_added_without_overwriting_existing_values(plug
     )
     assert "uid=999" in existing and "uid=123" not in existing
     assert "passkey=old" in existing and "passkey=secret" not in existing
+
+
+def test_task_rss_key_supports_default_custom_name_and_placeholder(plugin_module):
+    tracker = plugin_module.BrushFlowTracker
+    default_url = tracker._rss_url(
+        "https://tracker.example/rss.php?rows=20",
+        {"rss_key": "rss-secret", "rss_key_name": "rsskey"},
+    )
+    assert "rsskey=rss-secret" in default_url
+    custom_url = tracker._rss_url(
+        "https://tracker.example/rss.php?key={RSSKEY}",
+        {"rss_key": "custom-secret", "rss_key_name": "authkey"},
+    )
+    assert "key=custom-secret" in custom_url
+    assert "authkey=custom-secret" not in custom_url
     assert tracker._detail_url({"enclosure": "https://audiences.me/download.php?id=704450&downhash=secret"}) == (
         "https://audiences.me/details.php?id=704450&hit=1"
     )

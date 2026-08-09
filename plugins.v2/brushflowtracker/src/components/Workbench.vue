@@ -118,7 +118,7 @@ function confirmDeleteSite() {
 function addRssRule() {
   selectedSite.value.rss_rules.push({
     id: uid(), name: `RSS 任务 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
-    uid: '', passkey: '', cookie: '', user_agent: '', referer: '', use_proxy: null,
+    uid: '', passkey: '', rss_key: '', rss_key_name: 'rsskey', cookie: '', user_agent: '', referer: '', use_proxy: null,
     required_keywords: [], excluded_keywords: [], resolutions: [], promotion: 'any',
     publish_age_from_minutes: null, publish_age_to_minutes: null,
     size_from_gib: null, size_to_gib: null,
@@ -418,6 +418,8 @@ onMounted(() => loadStatus())
           <div class="rule-grid auth-grid">
             <VTextField v-model="authRule.uid" label="UID" placeholder="站点用户 UID" hide-details />
             <VTextField v-model="authRule.passkey" label="Passkey" type="password" placeholder="站点 Passkey" hide-details />
+            <VTextField v-model="authRule.rss_key" label="RSS 密钥" type="password" placeholder="站点提供的 RSS Key" hide-details />
+            <VTextField v-model="authRule.rss_key_name" label="RSS 密钥参数名" placeholder="默认 rsskey，也可能是 authkey" hide-details />
             <VTextarea v-model="authRule.cookie" class="span-2" label="Cookie（可选）" placeholder="从浏览器复制的完整 Cookie，例如 c_secure_uid=...; c_secure_pass=..." rows="3" auto-grow hide-details />
             <VTextField v-model="authRule.user_agent" label="User-Agent（可选）" placeholder="留空使用站点/MoviePilot 默认值" hide-details />
             <VTextField v-model="authRule.referer" label="Referer（可选）" placeholder="https://站点域名/" hide-details />

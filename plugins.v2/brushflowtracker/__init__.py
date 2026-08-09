@@ -103,7 +103,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -612,13 +612,19 @@ class BrushFlowTracker(_PluginBase):
         )
 
     @staticmethod
-    def _append_site_auth(url: str, site: Optional[Dict[str, Any]] = None) -> str:
+    def _append_site_auth(
+        url: str, site: Optional[Dict[str, Any]] = None, include_rss_key: bool = False
+    ) -> str:
         """为站点请求补齐 uid/passkey，但不覆盖 RSS 地址中已有的身份参数。"""
         if not url or not site:
             return url
         uid = str(site.get("uid") or "").strip()
         passkey = str(site.get("passkey") or "").strip()
-        if not uid and not passkey:
+        rss_key = str(site.get("rss_key") or "").strip() if include_rss_key else ""
+        rss_key_name = str(site.get("rss_key_name") or "rsskey").strip() or "rsskey"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", rss_key_name):
+            rss_key_name = "rsskey"
+        if not uid and not passkey and not rss_key:
             return url
         # 兼容用户从站点帮助页复制的占位符 URL。
         for token in ("{uid}", "{UID}", "%UID%", "<uid>"):
@@ -627,6 +633,12 @@ class BrushFlowTracker(_PluginBase):
         for token in ("{passkey}", "{PASSKEY}", "%PASSKEY%", "<passkey>"):
             if passkey:
                 url = url.replace(token, passkey)
+        rss_placeholder_replaced = False
+        for token in ("{rsskey}", "{RSSKEY}", "{rss_key}", "%RSSKEY%", "<rsskey>"):
+            if rss_key:
+                replaced = token in url
+                url = url.replace(token, rss_key)
+                rss_placeholder_replaced = rss_placeholder_replaced or replaced
         parts = urlsplit(url)
         pairs = parse_qsl(parts.query, keep_blank_values=True)
         keys = {str(key).casefold() for key, _value in pairs}
@@ -634,13 +646,15 @@ class BrushFlowTracker(_PluginBase):
             pairs.append(("uid", uid))
         if passkey and not keys.intersection({"passkey", "pass_key", "authkey"}):
             pairs.append(("passkey", passkey))
+        if rss_key and not rss_placeholder_replaced and rss_key_name.casefold() not in keys:
+            pairs.append((rss_key_name, rss_key))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
 
     @staticmethod
     def _rule_auth_site(site: Dict[str, Any], rule: Dict[str, Any]) -> Dict[str, Any]:
         """合并任务级认证与站点默认认证，任务填写的值优先。"""
         merged = dict(site or {})
-        for key in ("uid", "passkey", "cookie", "user_agent", "referer"):
+        for key in ("uid", "passkey", "rss_key", "rss_key_name", "cookie", "user_agent", "referer"):
             value = str(rule.get(key) or "").strip()
             if value:
                 merged[key] = value
@@ -650,7 +664,7 @@ class BrushFlowTracker(_PluginBase):
 
     @staticmethod
     def _rss_url(url: str, site: Optional[Dict[str, Any]] = None) -> str:
-        return BrushFlowTracker._append_site_auth(url, site)
+        return BrushFlowTracker._append_site_auth(url, site, include_rss_key=True)
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
         task_name = str(rule.get("name") or "RSS 任务").strip()

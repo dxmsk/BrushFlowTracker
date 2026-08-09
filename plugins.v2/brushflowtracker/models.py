@@ -15,6 +15,8 @@ class RssRulePayload(BaseModel):
     # 每条任务可使用独立的站点身份；为空时回退到站点级默认值。
     uid: str = ""
     passkey: str = ""
+    rss_key: str = ""
+    rss_key_name: str = "rsskey"
     cookie: str = ""
     user_agent: str = ""
     referer: str = ""

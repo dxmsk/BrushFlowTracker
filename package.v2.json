@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-    "version": "1.1.5",
+    "version": "1.1.6",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.6": "任务认证页面新增 RSS 密钥和自定义参数名，支持 rsskey/authkey 等站点参数及 RSSKEY 占位符",
       "v1.1.5": "每条 RSS 任务新增独立认证页面，可填写 UID、Passkey、Cookie、User-Agent、Referer 和代理继承；详情页请求保留 hit 参数并正确识别 HTTP 403",
       "v1.1.4": "新增站点 UID/Passkey 自动补全 RSS 身份参数，支持 MoviePilot 内置或自定义 qBittorrent，任务列表仅显示插件托管任务并补登记未即时返回 hash 的任务",
       "v1.1.3": "跨站点汇总候选后只添加最高分辨率一个，处理记录支持点击种子名称打开详情页",
