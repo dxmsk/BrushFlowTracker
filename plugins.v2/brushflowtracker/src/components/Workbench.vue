@@ -348,7 +348,7 @@ onMounted(() => loadStatus())
             </VWindowItem>
 
             <VWindowItem value="history">
-              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><strong>{{ row.title }}</strong><span>{{ row.reason || `${row.rule_name || 'RSS 任务'} · ${row.resolution || '未知画质'}` }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
+              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果；点击种子名称进入站点详情页</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><a v-if="row.link" :href="row.link" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><strong v-else>{{ row.title }}</strong><span>{{ row.reason || `${row.rule_name || 'RSS 任务'} · ${row.resolution || '未知画质'}` }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
             </VWindowItem>
 
             <VWindowItem value="settings">
@@ -442,7 +442,9 @@ onMounted(() => loadStatus())
 .history-list { display: flex; flex-direction: column; }
 .history-list article { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px; padding: 12px 4px; border-block-end: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); }
 .history-list article > div { display: flex; flex-direction: column; min-inline-size: 0; }
-.history-list article strong, .history-list article span { overflow-wrap: anywhere; }
+.history-list article strong, .history-list article a, .history-list article span { overflow-wrap: anywhere; }
+.history-list article a { color: rgb(var(--v-theme-primary)); font-weight: 600; text-decoration: none; }
+.history-list article a:hover { text-decoration: underline; }
 .history-list article span, .history-list time { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .8rem; }
 .settings-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-block-start: 18px; }
 @media (max-width: 1199px) { .cleanup-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

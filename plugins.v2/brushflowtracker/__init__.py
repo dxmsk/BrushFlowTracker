@@ -41,7 +41,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -224,9 +224,11 @@ class BrushFlowTracker(_PluginBase):
             service, error = self._qb_service()
             if error:
                 raise RuntimeError(error)
+            self._pending_candidates = []
             for site in self._target_sites(site_id):
-                site_result = self._scan_site(site, service)
+                site_result = self._scan_site(site, service, defer_add=True)
                 summary.update(site_result)
+            summary.update(self._flush_pending_candidates(service))
             self._record_run("rss", site_id, started, dict(summary), None)
             logger.info(f"刷流追新 RSS 完成：读取 {summary['fetched']}，命中 {summary['matched']}，添加 {summary['added']}")
             return dict(summary)
@@ -326,7 +328,7 @@ class BrushFlowTracker(_PluginBase):
             self._save_state()
             self._cleanup_lock.release()
 
-    def _scan_site(self, site: Dict[str, Any], service: Any) -> Counter:
+    def _scan_site(self, site: Dict[str, Any], service: Any, defer_add: bool = False) -> Counter:
         result = Counter()
         site_stats = self._state["site_stats"].setdefault(site["id"], {})
         for rule in site.get("rss_rules") or []:
@@ -366,7 +368,7 @@ class BrushFlowTracker(_PluginBase):
                         continue
                     candidates.append(item)
                 result["matched"] += len(candidates)
-                if self._highest_resolution_dedup and not rule.get("resolutions"):
+                if self._highest_resolution_dedup:
                     highest_candidates = choose_highest(candidates)
                     selected_urls = {item["enclosure"] for item in highest_candidates}
                     for item in candidates:
@@ -380,11 +382,14 @@ class BrushFlowTracker(_PluginBase):
                         result["duplicate"] += 1
                         self._log_selection(site, rule, item, "排除", "下载链接已处理")
                         continue
-                    if self._highest_resolution_dedup and not rule.get("resolutions"):
+                    if self._highest_resolution_dedup:
                         if not dedup_allows(item, self._state["dedup_records"]):
                             result["lower_resolution"] += 1
                             self._log_selection(site, rule, item, "排除", "不高于已下载画质")
                             continue
+                    if defer_add:
+                        self._pending_candidates.append({"site": site, "rule": rule, "item": item, "url_key": url_key, "now": now})
+                        continue
                     if self._add_item(site, rule, item, service):
                         result["added"] += 1
                         self._log_selection(site, rule, item, "添加", "符合全部条件")
@@ -403,6 +408,47 @@ class BrushFlowTracker(_PluginBase):
                 result["rule_errors"] += 1
                 logger.error(f"刷流追新站点 [{site['name']}] 规则 [{rule.get('name')}] 失败：{str(err)}")
         site_stats.update({"last_rss_at": isoformat(datetime.now().astimezone()), **dict(result)})
+        return result
+
+    def _flush_pending_candidates(self, service: Any) -> Counter:
+        """跨站点汇总候选，只添加每个影视身份的最高画质一个条目。"""
+        result = Counter()
+        pending = list(getattr(self, "_pending_candidates", []) or [])
+        self._pending_candidates = []
+        selected = {}
+        if not self._highest_resolution_dedup:
+            selected = {f"{index}:{record['item'].get('enclosure') or index}": record for index, record in enumerate(pending)}
+        for record in pending:
+            if not self._highest_resolution_dedup:
+                break
+            item = record["item"]
+            key = str(item.get("media_key") or item.get("enclosure") or "")
+            previous = selected.get(key)
+            if previous is None or int(item.get("resolution_rank") or 0) > int(previous["item"].get("resolution_rank") or 0):
+                if previous is not None:
+                    result["global_dedup"] += 1
+                    self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "跨站点同一影视已保留更高分辨率版本")
+                selected[key] = record
+            else:
+                result["global_dedup"] += 1
+                self._log_selection(record["site"], record["rule"], item, "排除", "跨站点同一影视已保留更高或同等分辨率版本")
+
+        for record in selected.values():
+            site, rule, item = record["site"], record["rule"], record["item"]
+            if self._add_item(site, rule, item, service):
+                result["added"] += 1
+                self._log_selection(site, rule, item, "添加", "符合全部条件且为全站点最高画质")
+                self._state["processed_urls"][record["url_key"]] = isoformat(record["now"])
+                if self._highest_resolution_dedup:
+                    self._state["dedup_records"][item["media_key"]] = {
+                        "title": item["title"],
+                        "resolution": item["resolution"],
+                        "resolution_rank": item["resolution_rank"],
+                        "updated_at": isoformat(record["now"]),
+                    }
+            else:
+                result["add_failed"] += 1
+                self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
         return result
 
     def _fetch_detail_promotion(self, site: Dict[str, Any], raw: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
@@ -494,6 +540,7 @@ class BrushFlowTracker(_PluginBase):
             "rule_id": rule["id"],
             "rule_name": rule.get("name"),
             "title": item["title"],
+            "link": item.get("link") or item.get("enclosure"),
             "resolution": item["resolution"],
             "promotion": item["promotion"],
             "free_until": isoformat(item.get("free_until")),

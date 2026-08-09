@@ -273,6 +273,36 @@ def test_audiences_detail_lookup_reuses_moviepilot_cookie(plugin_module, monkeyp
     assert captured["url"] == "https://audiences.me/details.php?id=704450"
 
 
+def test_global_flush_adds_only_highest_cross_site_resolution(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    downloader = FakeDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    site_a = {"id": "a", "name": "站点 A"}
+    site_b = {"id": "b", "name": "站点 B"}
+    rule_a = {"id": "ra", "name": "任务 A"}
+    rule_b = {"id": "rb", "name": "任务 B"}
+
+    def candidate(site, rule, url, resolution):
+        item = plugin_module.normalize_item(
+            {"title": f"Call Me By Fire S06E01 {resolution} WEB-DL", "enclosure": url}, now
+        )
+        return {"site": site, "rule": rule, "item": item, "url_key": url, "now": now}
+
+    plugin._pending_candidates = [
+        candidate(site_a, rule_a, "https://a.example/1080", "1080P"),
+        candidate(site_b, rule_b, "https://b.example/2160", "2160P"),
+        candidate(site_a, rule_a, "https://a.example/2160", "2160P"),
+    ]
+    result = plugin._flush_pending_candidates(service)
+
+    assert result["added"] == 1
+    assert result["global_dedup"] == 2
+    assert len(downloader.added) == 1
+    assert downloader.added[0]["content"] in {"https://b.example/2160", "https://a.example/2160"}
+
+
 def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):
     with pytest.raises(ValueError, match="任务名称不能为空"):
         plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": " "}]}])
