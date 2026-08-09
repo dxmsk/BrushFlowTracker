@@ -202,14 +202,25 @@ def match_rule(item: Dict[str, Any], rule: Dict[str, Any], now: Optional[datetim
     resolutions = {str(value).upper() for value in rule.get("resolutions") or []}
     if resolutions and item.get("resolution") not in resolutions:
         return False, "分辨率不匹配"
-    min_bytes = float(rule.get("min_size_gib") or 0) * 1024 ** 3
-    if min_bytes and int(item.get("size") or 0) < min_bytes:
-        return False, "文件小于最小限制"
-    max_age = float(rule.get("max_age_minutes") or 0)
+    size_from = _number(rule.get("size_from_gib"), None)
+    size_to = _number(rule.get("size_to_gib"), None)
+    if size_from is not None or size_to is not None:
+        size = int(item.get("size") or 0)
+        if size <= 0:
+            return False, "缺少文件大小，无法判断范围"
+        size_gib = size / 1024 ** 3
+        if (size_from is not None and size_gib < size_from) or (size_to is not None and size_gib > size_to):
+            return False, "文件大小不在范围"
+    age_from = _number(rule.get("publish_age_from_minutes"), None)
+    age_to = _number(rule.get("publish_age_to_minutes"), None)
     pubdate = item.get("pubdate")
     reference = now or datetime.now().astimezone()
-    if max_age and (not pubdate or reference - pubdate > timedelta(minutes=max_age)):
-        return False, "超过发种时间限制"
+    if age_from is not None or age_to is not None:
+        if not pubdate:
+            return False, "缺少发种时间，无法判断范围"
+        age_minutes = max((reference - pubdate).total_seconds() / 60, 0)
+        if (age_from is not None and age_minutes < age_from) or (age_to is not None and age_minutes > age_to):
+            return False, "发种时间不在范围"
     promotion_filter = rule.get("promotion", "any")
     if promotion_filter == "free" and item.get("promotion") != "free":
         return False, "不是免费种"
@@ -258,7 +269,7 @@ def first_cleanup_rule(
         if not rule.get("enabled", True):
             continue
         required_tags = set(split_terms(rule.get("labels")))
-        if required_tags and not required_tags.issubset(tags):
+        if required_tags and required_tags.isdisjoint(tags):
             continue
         if seeding_time < float(rule.get("min_seed_hours") or 0) * 3600:
             continue

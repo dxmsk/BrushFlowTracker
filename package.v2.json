@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.0": "站点块等高并按颜色区分，选种改为发种时间和文件大小范围，删种标签自动使用任务名并按任一标签匹配",
       "v1.0.1": "RSS 任务名支持自定义并作为唯一 qBittorrent 标签，日志记录每个条目的名称、链接和筛选结果",
       "v1.0.0": "实现多站点多 RSS 规则、最高分辨率持久化去重、免费期监控、顺序删种和 Vue 管理首页"
     }

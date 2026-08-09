@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import threading
 import traceback
@@ -37,7 +38,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -559,7 +560,16 @@ class BrushFlowTracker(_PluginBase):
 
     @staticmethod
     def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-        data = SettingsPayload(**config).model_dump()
+        raw_config = copy.deepcopy(config)
+        for site in raw_config.get("sites") or []:
+            for rule in site.get("rss_rules") or []:
+                if "publish_age_to_minutes" not in rule and rule.get("max_age_minutes") is not None:
+                    rule["publish_age_from_minutes"] = 0
+                    rule["publish_age_to_minutes"] = rule.get("max_age_minutes")
+                if "size_from_gib" not in rule and rule.get("min_size_gib") is not None:
+                    rule["size_from_gib"] = rule.get("min_size_gib")
+                    rule["size_to_gib"] = None
+        data = SettingsPayload(**raw_config).model_dump()
         seen_sites = set()
         for site in data["sites"]:
             site["id"] = site.get("id") or uuid.uuid4().hex
@@ -573,4 +583,8 @@ class BrushFlowTracker(_PluginBase):
                     if rule["id"] in seen_rules:
                         rule["id"] = uuid.uuid4().hex
                     seen_rules.add(rule["id"])
+            task_names = [rule["name"] for rule in site["rss_rules"]]
+            for rule in site["cleanup_rules"]:
+                labels = [label for label in split_terms(rule.get("labels")) if label in task_names]
+                rule["labels"] = labels or list(task_names)
         return data

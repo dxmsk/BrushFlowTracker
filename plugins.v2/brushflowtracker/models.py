@@ -2,7 +2,7 @@
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RssRulePayload(BaseModel):
@@ -15,8 +15,10 @@ class RssRulePayload(BaseModel):
     required_keywords: List[str] = Field(default_factory=list)
     excluded_keywords: List[str] = Field(default_factory=list)
     resolutions: List[str] = Field(default_factory=list)
-    max_age_minutes: Optional[float] = Field(default=None, ge=0)
-    min_size_gib: Optional[float] = Field(default=None, ge=0)
+    publish_age_from_minutes: Optional[float] = Field(default=None, ge=0)
+    publish_age_to_minutes: Optional[float] = Field(default=None, ge=0)
+    size_from_gib: Optional[float] = Field(default=None, ge=0)
+    size_to_gib: Optional[float] = Field(default=None, ge=0)
     promotion: Literal["any", "free", "free_or_2xfree", "2xfree"] = "any"
 
     @field_validator("name")
@@ -38,6 +40,23 @@ class RssRulePayload(BaseModel):
         if cleaned and not cleaned.lower().startswith(("http://", "https://")):
             raise ValueError("RSS 地址必须使用 http:// 或 https://")
         return cleaned
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> "RssRulePayload":
+        """保证发种时间和文件大小范围的起点不大于终点。"""
+        if (
+            self.publish_age_from_minutes is not None
+            and self.publish_age_to_minutes is not None
+            and self.publish_age_from_minutes > self.publish_age_to_minutes
+        ):
+            raise ValueError("发种时间范围起点不能大于终点")
+        if (
+            self.size_from_gib is not None
+            and self.size_to_gib is not None
+            and self.size_from_gib > self.size_to_gib
+        ):
+            raise ValueError("文件大小范围起点不能大于终点")
+        return self
 
 
 class CleanupRulePayload(BaseModel):
@@ -62,6 +81,15 @@ class SitePayload(BaseModel):
     user_agent: str = ""
     rss_rules: List[RssRulePayload] = Field(default_factory=list)
     cleanup_rules: List[CleanupRulePayload] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """保证站点名称与任务名称一样可明确编辑且不能为空。"""
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("站点名称不能为空")
+        return cleaned
 
 
 class SettingsPayload(BaseModel):

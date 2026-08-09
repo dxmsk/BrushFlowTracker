@@ -67,14 +67,37 @@ def test_match_rule_applies_exclusions_resolution_age_and_size():
     )
     assert core.match_rule(item, {"excluded_keywords": ["BAD-GROUP"]}, now)[0] is False
     assert core.match_rule(item, {"resolutions": ["4K"]}, now)[0] is False
-    assert core.match_rule(item, {"max_age_minutes": 10}, now)[0] is False
-    assert core.match_rule(item, {"min_size_gib": 5}, now)[0] is False
+    assert core.match_rule(item, {"publish_age_from_minutes": 0, "publish_age_to_minutes": 10}, now)[0] is False
+    assert core.match_rule(item, {"size_from_gib": 5, "size_to_gib": 30}, now)[0] is False
 
 
 def test_match_rule_rejects_missing_pubdate_when_age_limit_is_enabled():
     now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
     item = core.normalize_item({"title": "Example", "enclosure": "https://x/t"}, now)
-    assert core.match_rule(item, {"max_age_minutes": 60}, now) == (False, "超过发种时间限制")
+    assert core.match_rule(item, {"publish_age_from_minutes": 0, "publish_age_to_minutes": 60}, now) == (
+        False,
+        "缺少发种时间，无法判断范围",
+    )
+
+
+def test_match_rule_accepts_configured_age_and_size_ranges():
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    item = core.normalize_item(
+        {
+            "title": "Example 4K",
+            "enclosure": "https://x/t",
+            "size": 20 * 1024**3,
+            "pubdate": now - timedelta(minutes=15),
+        },
+        now,
+    )
+    rule = {
+        "publish_age_from_minutes": 0,
+        "publish_age_to_minutes": 30,
+        "size_from_gib": 0,
+        "size_to_gib": 30,
+    }
+    assert core.match_rule(item, rule, now) == (True, "命中")
 
 
 def test_match_rule_applies_free_filter():
@@ -117,3 +140,9 @@ def test_cleanup_requires_configured_task_label():
     torrent = {"tags": "其他任务", "ratio": 99, "seeding_time": 999999}
     rules = [{"enabled": True, "labels": ["追新动画"], "min_seed_hours": 0, "min_ratio": 0}]
     assert core.first_cleanup_rule(torrent, rules) is None
+
+
+def test_cleanup_matches_any_selected_task_label():
+    torrent = {"tags": "任务 B", "ratio": 2, "seeding_time": 5 * 3600}
+    rules = [{"id": "match", "enabled": True, "labels": ["任务 A", "任务 B"], "min_seed_hours": 1, "min_ratio": 1}]
+    assert core.first_cleanup_rule(torrent, rules)["id"] == "match"

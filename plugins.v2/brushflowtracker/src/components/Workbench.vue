@@ -22,6 +22,7 @@ const pluginBase = 'plugin/BrushFlowTracker'
 const sites = computed(() => draft.value.sites || [])
 const selectedSite = computed(() => sites.value.find(site => site.id === selectedSiteId.value) || null)
 const selectedSummary = computed(() => status.value.sites?.find(site => site.id === selectedSiteId.value) || {})
+const taskNameOptions = computed(() => selectedSite.value?.rss_rules?.map(rule => rule.name).filter(Boolean) || [])
 
 const resolutionOptions = ['8K', '4K', '1080P', '1080I', '720P', '576P', '480P']
 const promotionOptions = [
@@ -55,6 +56,10 @@ function uid() {
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value || {}))
+}
+
+function siteColor(index) {
+  return ['#6d4aff', '#00897b', '#d96c00', '#0277bd', '#c62828', '#6d4c41'][index % 6]
 }
 
 async function loadStatus(preserveDraft = false) {
@@ -103,15 +108,31 @@ function confirmDeleteSite() {
 function addRssRule() {
   selectedSite.value.rss_rules.push({
     id: uid(), name: `RSS 任务 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
-    required_keywords: [], excluded_keywords: [], resolutions: [], max_age_minutes: null,
-    min_size_gib: null, promotion: 'any',
+    required_keywords: [], excluded_keywords: [], resolutions: [], promotion: 'any',
+    publish_age_from_minutes: null, publish_age_to_minutes: null,
+    size_from_gib: null, size_to_gib: null,
   })
 }
 
 function addCleanupRule() {
   selectedSite.value.cleanup_rules.push({
     id: uid(), name: `删种规则 ${selectedSite.value.cleanup_rules.length + 1}`, enabled: true,
-    labels: [], min_seed_hours: 0, min_ratio: 0, delete_files: false,
+    labels: [...taskNameOptions.value], min_seed_hours: 0, min_ratio: 0, delete_files: false,
+  })
+}
+
+function updateTaskName(task, value) {
+  const previous = task.name
+  task.name = value
+  selectedSite.value.cleanup_rules.forEach(rule => {
+    rule.labels = (rule.labels || []).map(label => label === previous ? value : label)
+  })
+}
+
+function removeRssRule(index) {
+  const [removed] = selectedSite.value.rss_rules.splice(index, 1)
+  selectedSite.value.cleanup_rules.forEach(rule => {
+    rule.labels = (rule.labels || []).filter(label => label !== removed?.name)
   })
 }
 
@@ -129,7 +150,14 @@ function moveRule(collection, index, offset) {
 async function saveSettings() {
   saving.value = true
   try {
-    status.value = unwrap(await props.api.post(`${pluginBase}/settings`, draft.value))
+    const payload = clone(draft.value)
+    const rangeFields = [
+      'publish_age_from_minutes', 'publish_age_to_minutes', 'size_from_gib', 'size_to_gib',
+    ]
+    payload.sites.forEach(site => site.rss_rules.forEach(rule => {
+      rangeFields.forEach(key => { if (rule[key] === '') rule[key] = null })
+    }))
+    status.value = unwrap(await props.api.post(`${pluginBase}/settings`, payload))
     draft.value = clone(status.value.settings)
     await loadStatus(true)
     notify('配置已保存，定时任务已更新')
@@ -209,14 +237,17 @@ onMounted(() => loadStatus())
     <div v-if="loading && !sites.length" class="tracker__loading"><VSkeletonLoader type="list-item-three-line, article" /></div>
     <div v-else class="tracker__layout">
       <VSheet tag="aside" class="site-rail app-surface-static">
-        <div class="site-rail__head"><strong>站点</strong><VTooltip text="新增站点"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-plus" size="small" variant="text" @click="addSite" /></template></VTooltip></div>
+        <div class="site-rail__head"><strong>站点</strong></div>
         <div class="site-list">
-          <button v-for="site in sites" :key="site.id" type="button" class="site-item" :class="{ 'site-item--active': site.id === selectedSiteId }" @click="selectSite(site.id)">
+          <button v-for="(site, index) in sites" :key="site.id" type="button" class="site-item" :class="{ 'site-item--active': site.id === selectedSiteId }" :style="{ '--site-color': siteColor(index) }" @click="selectSite(site.id)">
             <span><i :class="{ online: site.enabled }" />{{ site.name || '未命名站点' }}</span>
             <small>{{ site.rss_rules.length }} 条 RSS · {{ site.cleanup_rules.length }} 条删种</small>
           </button>
+          <button type="button" class="site-item site-add" style="--site-color: #6d4aff" @click="addSite">
+            <span><VIcon icon="mdi-plus" size="18" />新增站点</span>
+            <small>创建新的站点配置</small>
+          </button>
         </div>
-        <VBtn block variant="tonal" prepend-icon="mdi-plus" @click="addSite">新增站点</VBtn>
       </VSheet>
 
       <main class="workspace">
@@ -225,7 +256,7 @@ onMounted(() => loadStatus())
         <template v-if="selectedSite">
           <div class="site-head">
             <div class="site-head__name">
-              <VTextField v-model="selectedSite.name" variant="plain" density="compact" hide-details aria-label="站点名称" />
+              <VTextField v-model="selectedSite.name" label="站点名称" variant="outlined" density="compact" :rules="[value => Boolean(String(value || '').trim()) || '站点名称不能为空']" hide-details="auto" />
               <VChip :color="selectedSite.enabled ? 'success' : 'default'" size="small" variant="tonal">{{ selectedSite.enabled ? '启用' : '停用' }}</VChip>
             </div>
             <div class="site-head__actions">
@@ -272,17 +303,23 @@ onMounted(() => loadStatus())
                     <VExpansionPanelTitle><div class="rule-title"><VIcon icon="mdi-rss" color="info" /><strong>{{ rule.name || `RSS 任务 ${index + 1}` }}</strong><VChip size="x-small" :color="rule.enabled ? 'success' : 'default'" variant="tonal">{{ rule.enabled ? '启用' : '停用' }}</VChip></div></VExpansionPanelTitle>
                     <VExpansionPanelText>
                       <div class="rule-grid">
-                        <VTextField v-model="rule.name" label="任务名称（同时作为标签）" :rules="[value => Boolean(String(value || '').trim()) || '任务名称不能为空', value => !String(value || '').includes(',') || '不能包含英文逗号']" hide-details="auto" />
+                        <VTextField :model-value="rule.name" label="任务名称（同时作为标签）" :rules="[value => Boolean(String(value || '').trim()) || '任务名称不能为空', value => !String(value || '').includes(',') || '不能包含英文逗号']" hide-details="auto" @update:model-value="updateTaskName(rule, $event)" />
                         <VSwitch v-model="rule.enabled" label="启用规则" hide-details color="success" inset />
                         <VTextField v-model="rule.url" class="span-2" label="RSS 订阅地址" placeholder="https://tracker.example/torrentrss.php?..." hide-details />
                         <VCombobox v-model="rule.required_keywords" label="必须包含关键词" multiple chips closable-chips hide-details />
                         <VCombobox v-model="rule.excluded_keywords" label="排除关键词" multiple chips closable-chips hide-details />
                         <VSelect v-model="rule.resolutions" :items="resolutionOptions" label="分辨率筛选" multiple chips closable-chips clearable hide-details />
                         <VSelect v-model="rule.promotion" :items="promotionOptions" label="免费期筛选" hide-details />
-                        <VTextField v-model.number="rule.max_age_minutes" type="number" min="0" label="最大发种时间（分钟）" clearable hide-details />
-                        <VTextField v-model.number="rule.min_size_gib" type="number" min="0" step="0.1" label="最小文件大小（GiB）" clearable hide-details />
+                        <div class="range-control">
+                          <span>发种时间范围（分钟）</span>
+                          <div class="range-fields"><VTextField v-model.number="rule.publish_age_from_minutes" type="number" min="0" label="从" suffix="分钟" clearable hide-details /><b>至</b><VTextField v-model.number="rule.publish_age_to_minutes" type="number" min="0" label="到" suffix="分钟" clearable hide-details /></div>
+                        </div>
+                        <div class="range-control">
+                          <span>文件大小范围（GiB）</span>
+                          <div class="range-fields"><VTextField v-model.number="rule.size_from_gib" type="number" min="0" step="0.1" label="从" suffix="GiB" clearable hide-details /><b>至</b><VTextField v-model.number="rule.size_to_gib" type="number" min="0" step="0.1" label="到" suffix="GiB" clearable hide-details /></div>
+                        </div>
                       </div>
-                      <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRule(selectedSite.rss_rules, index)">删除</VBtn></div>
+                      <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRssRule(index)">删除</VBtn></div>
                     </VExpansionPanelText>
                   </VExpansionPanel>
                 </VExpansionPanels>
@@ -298,9 +335,9 @@ onMounted(() => loadStatus())
                     <div class="order">{{ index + 1 }}</div>
                     <div class="cleanup-fields">
                       <VTextField v-model="rule.name" label="规则名称" hide-details />
-                      <VCombobox v-model="rule.labels" label="适用标签（全部匹配）" multiple chips closable-chips hide-details />
-                      <VTextField v-model.number="rule.min_seed_hours" type="number" min="0" step="0.5" label="最小做种时间（小时）" hide-details />
-                      <VTextField v-model.number="rule.min_ratio" type="number" min="0" step="0.1" label="最小分享率" hide-details />
+                      <VSelect v-model="rule.labels" :items="taskNameOptions" label="适用任务标签（任一匹配）" multiple chips closable-chips hide-details />
+                      <VTextField v-model.number="rule.min_seed_hours" type="number" min="0" step="0.5" label="满足做种小时数" suffix="小时" hide-details />
+                      <VTextField v-model.number="rule.min_ratio" type="number" min="0" step="0.1" label="满足分享率" hide-details />
                       <VSwitch v-model="rule.enabled" label="启用" hide-details color="success" inset />
                       <VSwitch v-model="rule.delete_files" label="同时删除文件" hide-details color="error" inset />
                     </div>
@@ -356,19 +393,21 @@ onMounted(() => loadStatus())
 .tracker__loading, .empty-workspace { min-block-size: 24rem; }
 .tracker__layout { display: grid; grid-template-columns: minmax(14rem, .3fr) minmax(0, 1.7fr); align-items: start; gap: 18px; }
 .site-rail { position: sticky; top: 76px; display: flex; flex-direction: column; gap: 10px; max-block-size: calc(100dvh - 100px); padding: 12px; border: var(--app-surface-border); border-radius: var(--app-surface-radius); }
-.site-list { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
-.site-item { display: flex; flex-direction: column; gap: 5px; inline-size: 100%; padding: 11px 12px; border: 1px solid transparent; border-radius: var(--app-control-radius); color: inherit; background: transparent; font: inherit; text-align: start; cursor: pointer; }
-.site-item:hover { background: rgba(var(--v-theme-primary), .05); }
-.site-item--active { border-color: rgba(var(--v-theme-primary), .3); background: rgba(var(--v-theme-primary), .1); }
+.site-list { display: flex; flex-direction: column; gap: 7px; min-block-size: 0; overflow-y: auto; }
+.site-item { display: flex; flex: 0 0 72px; flex-direction: column; justify-content: center; gap: 5px; inline-size: 100%; min-block-size: 72px; max-block-size: 72px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--site-color) 28%, transparent); border-inline-start: 4px solid var(--site-color); border-radius: var(--app-control-radius); color: inherit; background: color-mix(in srgb, var(--site-color) 5%, transparent); font: inherit; text-align: start; cursor: pointer; }
+.site-item:hover { background: color-mix(in srgb, var(--site-color) 10%, transparent); }
+.site-item--active { border-color: color-mix(in srgb, var(--site-color) 48%, transparent); border-inline-start-color: var(--site-color); background: color-mix(in srgb, var(--site-color) 14%, transparent); }
+.site-add { border-style: dashed; }
 .site-item span { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
 .site-item i { inline-size: 8px; block-size: 8px; flex: 0 0 auto; border-radius: 50%; background: rgb(var(--v-theme-secondary)); }
-.site-item i.online { background: rgb(var(--v-theme-success)); }
+.site-item i.online { background: var(--site-color); }
 .site-item small, .block-muted, .task-name small { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); }
 .workspace { min-inline-size: 0; }
 .mobile-site { display: none; }
 .site-head { min-block-size: 52px; }
 .site-head__name { flex: 1 1 auto; gap: 8px; min-inline-size: 0; }
-.site-head__name :deep(.v-field__input) { min-block-size: 40px; padding: 0; font-size: 1.2rem; font-weight: 600; }
+.site-head__name :deep(.v-text-field) { max-inline-size: 28rem; }
+.site-head__name :deep(.v-field__input) { font-size: 1rem; font-weight: 600; }
 .tracker-tabs { max-inline-size: 100%; }
 .tracker-window { padding-block-start: 16px; }
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-block-end: 12px; }
@@ -390,6 +429,10 @@ onMounted(() => loadStatus())
 .rule-title strong { overflow-wrap: anywhere; }
 .rule-grid, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding-block: 8px; }
 .span-2 { grid-column: 1 / -1; }
+.range-control { display: flex; flex-direction: column; gap: 7px; min-inline-size: 0; }
+.range-control > span { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .8rem; }
+.range-fields { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; }
+.range-fields b { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-weight: 400; }
 .rule-actions { margin-block-start: 12px; }
 .cleanup-list { display: flex; flex-direction: column; gap: 10px; }
 .cleanup-rule { display: grid; grid-template-columns: 32px minmax(0, 1fr) 36px; align-items: center; gap: 12px; padding: 14px; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: var(--app-control-radius); }

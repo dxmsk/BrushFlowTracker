@@ -150,6 +150,28 @@ def test_config_normalization_assigns_unique_site_and_rule_ids(plugin_module):
     ]
     assert len(ids) == len(set(ids)) == 2
     assert len(rule_ids) == len(set(rule_ids)) == 3
+    assert plugin._sites[0]["cleanup_rules"][0]["labels"] == ["R1", "R2"]
+
+
+def test_legacy_limits_migrate_to_ranges(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin(
+        {
+            "sites": [
+                {
+                    "name": "A",
+                    "rss_rules": [{"name": "R1", "max_age_minutes": 30, "min_size_gib": 5}],
+                }
+            ]
+        }
+    )
+    task = plugin._sites[0]["rss_rules"][0]
+    assert task["publish_age_from_minutes"] == 0
+    assert task["publish_age_to_minutes"] == 30
+    assert task["size_from_gib"] == 5
+    assert task["size_to_gib"] is None
+    assert "max_age_minutes" not in task
+    assert "min_size_gib" not in task
 
 
 def test_status_exposes_one_shared_downloader_setting(plugin_module):
@@ -202,3 +224,15 @@ def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):
         plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": " "}]}])
     with pytest.raises(ValueError, match="任务名称不能包含英文逗号"):
         plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": "电影,追新"}]}])
+
+
+def test_site_name_cannot_be_empty(plugin_module):
+    with pytest.raises(ValueError, match="站点名称不能为空"):
+        plugin_module.SettingsPayload(sites=[{"name": " "}])
+
+
+def test_range_start_cannot_exceed_end(plugin_module):
+    with pytest.raises(ValueError, match="发种时间范围起点不能大于终点"):
+        plugin_module.SettingsPayload(
+            sites=[{"name": "A", "rss_rules": [{"name": "R1", "publish_age_from_minutes": 30, "publish_age_to_minutes": 0}]}]
+        )
