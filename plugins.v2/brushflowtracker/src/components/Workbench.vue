@@ -15,6 +15,11 @@ const error = ref('')
 const activeTab = ref(props.initialTab)
 const selectedSiteId = ref('')
 const deleteSiteDialog = ref(false)
+const authRule = ref(null)
+const authDialog = computed({
+  get: () => Boolean(authRule.value),
+  set: value => { if (!value) authRule.value = null },
+})
 const status = ref({ settings: { sites: [] }, sites: [], tasks: [], history: [], downloaders: [] })
 const draft = ref({ sites: [] })
 
@@ -113,10 +118,15 @@ function confirmDeleteSite() {
 function addRssRule() {
   selectedSite.value.rss_rules.push({
     id: uid(), name: `RSS 任务 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
+    uid: '', passkey: '', cookie: '', user_agent: '', referer: '', use_proxy: null,
     required_keywords: [], excluded_keywords: [], resolutions: [], promotion: 'any',
     publish_age_from_minutes: null, publish_age_to_minutes: null,
     size_from_gib: null, size_to_gib: null,
   })
+}
+
+function openAuthPage(rule) {
+  authRule.value = rule
 }
 
 function addCleanupRule() {
@@ -333,7 +343,7 @@ onMounted(() => loadStatus())
                           <div class="range-fields"><VTextField v-model.number="rule.size_from_gib" type="number" min="0" step="0.1" label="从" suffix="GiB" clearable hide-details /><b>至</b><VTextField v-model.number="rule.size_to_gib" type="number" min="0" step="0.1" label="到" suffix="GiB" clearable hide-details /></div>
                         </div>
                       </div>
-                      <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRssRule(index)">删除</VBtn></div>
+                      <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn variant="tonal" color="primary" prepend-icon="mdi-shield-key-outline" @click="openAuthPage(rule)">认证/防403</VBtn><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRssRule(index)">删除</VBtn></div>
                     </VExpansionPanelText>
                   </VExpansionPanel>
                 </VExpansionPanels>
@@ -401,6 +411,23 @@ onMounted(() => loadStatus())
       </main>
     </div>
 
+    <VDialog v-model="authDialog" max-width="52rem" scrollable>
+      <VCard v-if="authRule" title="任务认证与防 403">
+        <VCardText>
+          <p class="block-muted auth-help">此页面只作用于当前 RSS 任务。任务级填写优先于站点默认值；留空则继承站点设置或 MoviePilot 站点 Cookie。</p>
+          <div class="rule-grid auth-grid">
+            <VTextField v-model="authRule.uid" label="UID" placeholder="站点用户 UID" hide-details />
+            <VTextField v-model="authRule.passkey" label="Passkey" type="password" placeholder="站点 Passkey" hide-details />
+            <VTextarea v-model="authRule.cookie" class="span-2" label="Cookie（可选）" placeholder="从浏览器复制的完整 Cookie，例如 c_secure_uid=...; c_secure_pass=..." rows="3" auto-grow hide-details />
+            <VTextField v-model="authRule.user_agent" label="User-Agent（可选）" placeholder="留空使用站点/MoviePilot 默认值" hide-details />
+            <VTextField v-model="authRule.referer" label="Referer（可选）" placeholder="https://站点域名/" hide-details />
+            <VSwitch v-model="authRule.use_proxy" label="此任务使用代理（留空继承站点）" color="primary" inset hide-details />
+          </div>
+          <VAlert class="auth-alert" type="info" variant="tonal" density="compact">Audiences/NexusPHP 页面只显示“免费”徽章时，建议同时填写 Cookie；UID/Passkey 会自动补到 RSS 和详情地址。</VAlert>
+        </VCardText>
+        <VCardActions><VSpacer /><VBtn variant="text" @click="authRule = null">关闭</VBtn></VCardActions>
+      </VCard>
+    </VDialog>
     <VDialog v-model="deleteSiteDialog" max-width="28rem"><VCard title="删除站点"><VCardText>删除“{{ selectedSite?.name }}”及其所有规则？下载器中的现有任务不会被删除。</VCardText><VCardActions><VSpacer /><VBtn variant="text" @click="deleteSiteDialog = false">取消</VBtn><VBtn color="error" variant="flat" @click="confirmDeleteSite">删除</VBtn></VCardActions></VCard></VDialog>
   </div>
 </template>

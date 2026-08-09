@@ -242,7 +242,7 @@ def test_site_uid_and_passkey_are_added_without_overwriting_existing_values(plug
     assert "uid=999" in existing and "uid=123" not in existing
     assert "passkey=old" in existing and "passkey=secret" not in existing
     assert tracker._detail_url({"enclosure": "https://audiences.me/download.php?id=704450&downhash=secret"}) == (
-        "https://audiences.me/details.php?id=704450"
+        "https://audiences.me/details.php?id=704450&hit=1"
     )
 
 
@@ -286,7 +286,7 @@ def test_audiences_detail_lookup_reuses_moviepilot_cookie(plugin_module, monkeyp
     assert result["free_until"] == now + timedelta(hours=23, minutes=53)
     assert captured["domain"] == "audiences.me"
     assert captured["cookies"] == "uid=1; pass=secret"
-    assert captured["url"] == "https://audiences.me/details.php?id=704450"
+    assert captured["url"] == "https://audiences.me/details.php?id=704450&hit=1"
 
 
 def test_global_flush_adds_only_highest_cross_site_resolution(plugin_module):

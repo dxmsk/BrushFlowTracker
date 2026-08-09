@@ -103,7 +103,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -403,12 +403,13 @@ class BrushFlowTracker(_PluginBase):
             if not rule.get("enabled") or not rule.get("url"):
                 continue
             try:
-                rss_url = self._rss_url(rule["url"], site)
+                auth_site = self._rule_auth_site(site, rule)
+                rss_url = self._rss_url(rule["url"], auth_site)
                 raw_items = RssHelper().parse(
                     url=rss_url,
-                    proxy=bool(site.get("use_proxy")),
+                    proxy=bool(auth_site.get("use_proxy")),
                     timeout=self._request_timeout_seconds,
-                    ua=site.get("user_agent") or None,
+                    ua=auth_site.get("user_agent") or None,
                 )
                 if raw_items is None:
                     raise RuntimeError("RSS 地址已过期")
@@ -427,7 +428,7 @@ class BrushFlowTracker(_PluginBase):
                             self._log_selection(site, rule, item, "排除", pre_reason)
                             continue
                         if item.get("promotion") == "normal":
-                            detail = self._fetch_detail_promotion(site, raw, now)
+                            detail = self._fetch_detail_promotion(auth_site, raw, now)
                             if detail:
                                 item = normalize_item({**raw, **detail}, now)
                     matched, reason = match_rule(item, rule, now)
@@ -531,22 +532,29 @@ class BrushFlowTracker(_PluginBase):
 
             domain = (urlsplit(detail_url).hostname or "").lower()
             auth_cache = getattr(self, "_site_auth_cache", {})
-            if domain not in auth_cache:
+            auth_key = (domain, str(site.get("cookie") or ""), str(site.get("uid") or ""), str(site.get("passkey") or ""))
+            if auth_key not in auth_cache:
                 configured = SiteOper().get_by_domain(domain) if domain else None
-                auth_cache[domain] = (
-                    getattr(configured, "cookie", None) if configured else None,
-                    getattr(configured, "ua", None) if configured else None,
-                    bool(getattr(configured, "proxy", False)) if configured else bool(site.get("use_proxy")),
+                auth_cache[auth_key] = (
+                    site.get("cookie") or (getattr(configured, "cookie", None) if configured else None),
+                    site.get("user_agent") or (getattr(configured, "ua", None) if configured else None),
+                    bool(site.get("use_proxy")) if "use_proxy" in site else bool(getattr(configured, "proxy", False)),
                 )
                 self._site_auth_cache = auth_cache
-            cookie, ua, use_proxy = auth_cache[domain]
+            cookie, ua, use_proxy = auth_cache[auth_key]
             response = RequestUtils(
                 cookies=cookie,
                 ua=ua or site.get("user_agent") or None,
+                headers={
+                    "Referer": site.get("referer") or f"{urlsplit(detail_url).scheme}://{urlsplit(detail_url).netloc}/",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
                 proxies=self._proxy_config() if use_proxy else None,
                 timeout=self._request_timeout_seconds,
             ).get_res(detail_url)
-            if not response:
+            # requests.Response 在 4xx/5xx 时布尔值为 False，不能误报成“无响应”。
+            if response is None:
                 logger.warning(f"刷流追新读取详情页免费状态失败：{detail_url} 无响应，请检查站点 Cookie/网络")
                 return None
             if getattr(response, "status_code", 200) != 200:
@@ -591,8 +599,16 @@ class BrushFlowTracker(_PluginBase):
         torrent_id = (query.get("id") or [None])[0]
         if not torrent_id:
             return None
+        detail_pairs = [
+            (key, value)
+            for key, values in query.items()
+            for value in values
+            if key.casefold() != "downhash"
+        ]
+        if not any(key.casefold() == "hit" for key, _value in detail_pairs):
+            detail_pairs.append(("hit", "1"))
         return BrushFlowTracker._append_site_auth(
-            urlunsplit((parts.scheme, parts.netloc, "/details.php", urlencode({"id": torrent_id}), "")), site
+            urlunsplit((parts.scheme, parts.netloc, "/details.php", urlencode(detail_pairs), "")), site
         )
 
     @staticmethod
@@ -619,6 +635,18 @@ class BrushFlowTracker(_PluginBase):
         if passkey and not keys.intersection({"passkey", "pass_key", "authkey"}):
             pairs.append(("passkey", passkey))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+
+    @staticmethod
+    def _rule_auth_site(site: Dict[str, Any], rule: Dict[str, Any]) -> Dict[str, Any]:
+        """合并任务级认证与站点默认认证，任务填写的值优先。"""
+        merged = dict(site or {})
+        for key in ("uid", "passkey", "cookie", "user_agent", "referer"):
+            value = str(rule.get(key) or "").strip()
+            if value:
+                merged[key] = value
+        if rule.get("use_proxy") is not None:
+            merged["use_proxy"] = bool(rule.get("use_proxy"))
+        return merged
 
     @staticmethod
     def _rss_url(url: str, site: Optional[Dict[str, Any]] = None) -> str:

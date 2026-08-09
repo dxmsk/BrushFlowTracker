@@ -12,6 +12,13 @@ class RssRulePayload(BaseModel):
     name: str = "RSS 任务"
     enabled: bool = True
     url: str = ""
+    # 每条任务可使用独立的站点身份；为空时回退到站点级默认值。
+    uid: str = ""
+    passkey: str = ""
+    cookie: str = ""
+    user_agent: str = ""
+    referer: str = ""
+    use_proxy: Optional[bool] = None
     required_keywords: List[str] = Field(default_factory=list)
     excluded_keywords: List[str] = Field(default_factory=list)
     resolutions: List[str] = Field(default_factory=list)
