@@ -79,6 +79,10 @@ class SitePayload(BaseModel):
     enabled: bool = True
     use_proxy: bool = False
     user_agent: str = ""
+    # NexusPHP/Tracker 站点身份信息。配置后会自动补到 RSS/详情请求，
+    # 既方便使用不带身份参数的 RSS 地址，也能降低站点返回 403 的概率。
+    uid: str = ""
+    passkey: str = ""
     rss_rules: List[RssRulePayload] = Field(default_factory=list)
     cleanup_rules: List[CleanupRulePayload] = Field(default_factory=list)
 
@@ -97,7 +101,15 @@ class SettingsPayload(BaseModel):
 
     enabled: bool = False
     show_sidebar_nav: bool = True
+    # moviepilot 使用 MoviePilot 下载器管理中已配置的 qB；custom 使用下面的直连参数。
+    downloader_mode: Literal["moviepilot", "custom"] = "moviepilot"
     downloader: str = ""
+    custom_qb_url: str = ""
+    custom_qb_host: str = ""
+    custom_qb_port: int = Field(default=8080, ge=1, le=65535)
+    custom_qb_username: str = ""
+    custom_qb_password: str = ""
+    custom_qb_save_path: str = ""
     highest_resolution_dedup: bool = True
     rss_interval_minutes: int = Field(default=10, ge=1, le=10080)
     free_monitor_interval_minutes: int = Field(default=2, ge=1, le=1440)
@@ -118,3 +130,10 @@ class DownloaderTestPayload(BaseModel):
     """测试一个 qBittorrent 服务的请求。"""
 
     downloader: str = ""
+    downloader_mode: Literal["moviepilot", "custom"] = "moviepilot"
+    custom_qb_url: str = ""
+    custom_qb_host: str = ""
+    custom_qb_port: int = Field(default=8080, ge=1, le=65535)
+    custom_qb_username: str = ""
+    custom_qb_password: str = ""
+    custom_qb_save_path: str = ""

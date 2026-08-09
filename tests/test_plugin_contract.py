@@ -225,6 +225,22 @@ def test_audiences_detail_url_can_be_recovered_from_download_link(plugin_module)
     assert tracker._detail_url({"link": "https://audiences.me/details.php?id=704450&hit=1"}) == (
         "https://audiences.me/details.php?id=704450&hit=1"
     )
+
+
+def test_site_uid_and_passkey_are_added_without_overwriting_existing_values(plugin_module):
+    tracker = plugin_module.BrushFlowTracker
+    url = tracker._rss_url(
+        "https://tracker.example/torrentrss.php?rows=20",
+        {"uid": "123", "passkey": "secret"},
+    )
+    assert "uid=123" in url
+    assert "passkey=secret" in url
+    existing = tracker._rss_url(
+        "https://tracker.example/torrentrss.php?uid=999&passkey=old",
+        {"uid": "123", "passkey": "secret"},
+    )
+    assert "uid=999" in existing and "uid=123" not in existing
+    assert "passkey=old" in existing and "passkey=secret" not in existing
     assert tracker._detail_url({"enclosure": "https://audiences.me/download.php?id=704450&downhash=secret"}) == (
         "https://audiences.me/details.php?id=704450"
     )
@@ -301,6 +317,30 @@ def test_global_flush_adds_only_highest_cross_site_resolution(plugin_module):
     assert result["global_dedup"] == 2
     assert len(downloader.added) == 1
     assert downloader.added[0]["content"] in {"https://b.example/2160", "https://a.example/2160"}
+
+
+def test_pending_plugin_task_is_reconciled_and_only_managed_tasks_are_shown(plugin_module, monkeypatch):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({"downloader": "main-qb", "sites": [{"id": "a", "name": "A"}]})
+    plugin._state["pending_managed"] = [{
+        "site_id": "a", "site_name": "A", "rule_name": "追新", "title": "Show S01E01 1080P",
+        "tags": ["追新"], "resolution": "1080P", "promotion": "normal", "free_until": None,
+    }]
+
+    class Tasks:
+        def get_torrents(self):
+            return [
+                {"hash": "PLUGIN", "name": "Show S01E01 1080P", "tags": "追新", "progress": 0.5},
+                {"hash": "OTHER", "name": "Other task", "tags": "其他", "progress": 1},
+            ], False
+
+    service = type("Service", (), {"instance": Tasks()})()
+    monkeypatch.setattr(plugin, "_qb_service", lambda *_args, **_kwargs: (service, None))
+    rows, error = plugin._site_torrents(plugin._sites[0])
+    assert error is None
+    assert [row["hash"] for row in rows] == ["PLUGIN"]
+    assert "plugin" in plugin._state["managed"]
+    assert plugin._state["pending_managed"] == []
 
 
 def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):

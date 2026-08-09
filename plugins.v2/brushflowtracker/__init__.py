@@ -6,13 +6,15 @@ import copy
 import hashlib
 import re
 import threading
+import time
 import traceback
 import uuid
 from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from html import unescape
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from types import SimpleNamespace
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app import schemas
 from app.helper.downloader import DownloaderHelper
@@ -35,13 +37,73 @@ from .core import (
 from .models import DownloaderTestPayload, RunPayload, SettingsPayload
 
 
+class _CustomQBAdapter:
+    """把 qbittorrent-api 的对象转换为插件现有的 MoviePilot 下载器接口。"""
+
+    def __init__(self, client: Any, save_path: str = ""):
+        self.client = client
+        self.save_path = save_path
+
+    @staticmethod
+    def _value(item: Any, key: str, default: Any = None) -> Any:
+        try:
+            if hasattr(item, "get"):
+                value = item.get(key)
+                return default if value is None else value
+        except Exception:
+            pass
+        return getattr(item, key, default)
+
+    def get_torrents(self, tags: Optional[str] = None):
+        try:
+            kwargs = {"tag": tags} if tags else {}
+            rows = list(self.client.torrents_info(**kwargs) or [])
+            result = []
+            for row in rows:
+                data = {}
+                for key in (
+                    "hash", "name", "size", "total_size", "progress", "state", "ratio",
+                    "seeding_time", "dlspeed", "upspeed", "added_on", "amount_left", "tags",
+                ):
+                    data[key] = self._value(row, key)
+                result.append(data)
+            return result, False
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qB 查询任务失败：{err}")
+            return [], True
+
+    def add_torrent(self, content: str, tag: str = ""):
+        try:
+            kwargs = {"urls": content, "tags": tag or None}
+            if self.save_path:
+                kwargs["save_path"] = self.save_path
+            response = self.client.torrents_add(**kwargs)
+            hashes = self._value(response, "added_torrent_ids", []) or []
+            if isinstance(hashes, str):
+                hashes = [hashes]
+            hashes = [str(value) for value in hashes if value]
+            text = str(response or "").casefold()
+            return bool(hashes or "ok" in text or "added" in text), hashes
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qB 添加任务失败：{err}")
+            return False, []
+
+    def delete_torrents(self, ids: List[str], delete_file: bool = False):
+        try:
+            self.client.torrents_delete(torrent_hashes=ids, delete_files=bool(delete_file))
+            return True
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qB 删除任务失败：{err}")
+            return False
+
+
 class BrushFlowTracker(_PluginBase):
     """使用一个 qBittorrent 连接管理多站点 RSS 追新与刷流任务。"""
 
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -57,6 +119,7 @@ class BrushFlowTracker(_PluginBase):
         self._enabled = normalized["enabled"]
         self._show_sidebar_nav = normalized["show_sidebar_nav"]
         self._downloader = normalized["downloader"]
+        self._downloader_mode = normalized.get("downloader_mode", "moviepilot")
         self._highest_resolution_dedup = normalized["highest_resolution_dedup"]
         self._rss_interval_minutes = normalized["rss_interval_minutes"]
         self._free_monitor_interval_minutes = normalized["free_monitor_interval_minutes"]
@@ -74,6 +137,7 @@ class BrushFlowTracker(_PluginBase):
             "dedup_records": dict(state.get("dedup_records") or {}),
             "processed_urls": dict(state.get("processed_urls") or {}),
             "managed": dict(state.get("managed") or {}),
+            "pending_managed": list(state.get("pending_managed") or []),
             "history": list(state.get("history") or []),
             "site_stats": dict(state.get("site_stats") or {}),
             "last_runs": dict(state.get("last_runs") or {}),
@@ -205,7 +269,9 @@ class BrushFlowTracker(_PluginBase):
 
     def test_downloader(self, payload: DownloaderTestPayload) -> schemas.Response:
         """验证全局选择的服务确实是可用的 qBittorrent。"""
-        service, error = self._qb_service(payload.downloader or None)
+        test_config = dict(self._config)
+        test_config.update(payload.model_dump(exclude_unset=True))
+        service, error = self._qb_service(payload.downloader or None, test_config)
         if error:
             return schemas.Response(success=False, message=error)
         torrents, failed = service.instance.get_torrents()
@@ -254,6 +320,7 @@ class BrushFlowTracker(_PluginBase):
             torrents, failed = service.instance.get_torrents()
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
+            self._reconcile_pending_managed(service, torrents)
             torrent_map = {str(item.get("hash") or "").lower(): item for item in torrents or []}
             now = datetime.now().astimezone()
             for torrent_hash, record in list(self._state["managed"].items()):
@@ -300,6 +367,7 @@ class BrushFlowTracker(_PluginBase):
             torrents, failed = service.instance.get_torrents()
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
+            self._reconcile_pending_managed(service, torrents)
             for site in self._target_sites(site_id):
                 rules = site.get("cleanup_rules") or []
                 if not rules:
@@ -335,8 +403,9 @@ class BrushFlowTracker(_PluginBase):
             if not rule.get("enabled") or not rule.get("url"):
                 continue
             try:
+                rss_url = self._rss_url(rule["url"], site)
                 raw_items = RssHelper().parse(
-                    url=rule["url"],
+                    url=rss_url,
                     proxy=bool(site.get("use_proxy")),
                     timeout=self._request_timeout_seconds,
                     ua=site.get("user_agent") or None,
@@ -453,7 +522,7 @@ class BrushFlowTracker(_PluginBase):
 
     def _fetch_detail_promotion(self, site: Dict[str, Any], raw: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
         """读取 NexusPHP 详情页的免费徽章与剩余时间，弥补 RSS 不返回促销字段的站点。"""
-        detail_url = self._detail_url(raw)
+        detail_url = self._detail_url(raw, site)
         if not detail_url:
             return None
         try:
@@ -507,11 +576,11 @@ class BrushFlowTracker(_PluginBase):
             return None
 
     @staticmethod
-    def _detail_url(raw: Dict[str, Any]) -> Optional[str]:
+    def _detail_url(raw: Dict[str, Any], site: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """优先使用 RSS 详情链接，否则将 NexusPHP download.php 链接转换为 details.php。"""
         link = str(raw.get("link") or "").strip()
         if link and "details.php" in link.lower():
-            return link
+            return BrushFlowTracker._append_site_auth(link, site)
         enclosure = str(raw.get("enclosure") or "").strip()
         parts = urlsplit(link or enclosure)
         if not parts.scheme or not parts.netloc:
@@ -522,7 +591,38 @@ class BrushFlowTracker(_PluginBase):
         torrent_id = (query.get("id") or [None])[0]
         if not torrent_id:
             return None
-        return urlunsplit((parts.scheme, parts.netloc, "/details.php", urlencode({"id": torrent_id}), ""))
+        return BrushFlowTracker._append_site_auth(
+            urlunsplit((parts.scheme, parts.netloc, "/details.php", urlencode({"id": torrent_id}), "")), site
+        )
+
+    @staticmethod
+    def _append_site_auth(url: str, site: Optional[Dict[str, Any]] = None) -> str:
+        """为站点请求补齐 uid/passkey，但不覆盖 RSS 地址中已有的身份参数。"""
+        if not url or not site:
+            return url
+        uid = str(site.get("uid") or "").strip()
+        passkey = str(site.get("passkey") or "").strip()
+        if not uid and not passkey:
+            return url
+        # 兼容用户从站点帮助页复制的占位符 URL。
+        for token in ("{uid}", "{UID}", "%UID%", "<uid>"):
+            if uid:
+                url = url.replace(token, uid)
+        for token in ("{passkey}", "{PASSKEY}", "%PASSKEY%", "<passkey>"):
+            if passkey:
+                url = url.replace(token, passkey)
+        parts = urlsplit(url)
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        keys = {str(key).casefold() for key, _value in pairs}
+        if uid and not keys.intersection({"uid", "userid", "user_id"}):
+            pairs.append(("uid", uid))
+        if passkey and not keys.intersection({"passkey", "pass_key", "authkey"}):
+            pairs.append(("passkey", passkey))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(pairs), parts.fragment))
+
+    @staticmethod
+    def _rss_url(url: str, site: Optional[Dict[str, Any]] = None) -> str:
+        return BrushFlowTracker._append_site_auth(url, site)
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
         task_name = str(rule.get("name") or "RSS 任务").strip()
@@ -549,6 +649,8 @@ class BrushFlowTracker(_PluginBase):
         }
         for torrent_hash in hashes:
             self._state["managed"][torrent_hash] = dict(record)
+        if not hashes:
+            self._state["pending_managed"].append(dict(record))
         self._append_history({**record, "event": "added", "torrent_hashes": hashes})
         if item["promotion"] != "normal" and not item.get("free_until"):
             logger.warning(f"刷流追新已添加免费种但无法识别截止时间：{item['title']}")
@@ -576,12 +678,23 @@ class BrushFlowTracker(_PluginBase):
         )
 
     def _find_added_hashes(self, service: Any, task_name: str, title: str) -> List[str]:
-        torrents, failed = service.instance.get_torrents(tags=task_name)
-        if failed:
-            return []
-        matches = [item for item in torrents or [] if str(item.get("name") or "").strip() == title.strip()]
-        matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
-        return [str(matches[0].get("hash") or "").lower()] if matches else []
+        # 不依赖 qB 的 tag 过滤参数（旧版 MoviePilot/qB 对 tags 参数支持不一致），
+        # 先取全部任务，再按本插件设置的任务标签和名称匹配。
+        for _attempt in range(3):
+            torrents, failed = service.instance.get_torrents()
+            if not failed:
+                matches = []
+                for item in torrents or []:
+                    tags = set(split_terms(item.get("tags")))
+                    name = str(item.get("name") or "").strip()
+                    if task_name in tags and (name == title.strip() or title.strip() in name or name in title.strip()):
+                        matches.append(item)
+                matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
+                if matches:
+                    return [str(matches[0].get("hash") or "").lower()]
+            if _attempt < 2:
+                time.sleep(0.4)
+        return []
 
     def _site_torrents(self, site: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         service, error = self._qb_service()
@@ -590,6 +703,7 @@ class BrushFlowTracker(_PluginBase):
         torrents, failed = service.instance.get_torrents()
         if failed:
             return [], "读取 qBittorrent 任务失败"
+        self._reconcile_pending_managed(service, torrents)
         managed_hashes = {
             torrent_hash
             for torrent_hash, record in self._state["managed"].items()
@@ -613,7 +727,41 @@ class BrushFlowTracker(_PluginBase):
             if str(item.get("hash") or "").lower() in managed_hashes
         ], None
 
-    def _qb_service(self, downloader: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
+    def _reconcile_pending_managed(
+        self, service: Any, torrents: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
+        """补登记 qB 添加接口未立即返回 hash 的插件任务。"""
+        pending = list(self._state.get("pending_managed") or [])
+        if not pending:
+            return
+        if torrents is None:
+            torrents, failed = service.instance.get_torrents()
+            if failed:
+                return
+        remaining = []
+        for record in pending:
+            task_name = str(record.get("rule_name") or "").strip()
+            title = str(record.get("title") or "").strip()
+            matched_hash = None
+            for item in torrents or []:
+                tags = set(split_terms(item.get("tags")))
+                name = str(item.get("name") or "").strip()
+                if task_name in tags and title and (name == title or title in name or name in title):
+                    matched_hash = str(item.get("hash") or "").lower()
+                    if matched_hash:
+                        break
+            if matched_hash:
+                self._state["managed"][matched_hash] = dict(record)
+            else:
+                remaining.append(record)
+        self._state["pending_managed"] = remaining
+
+    def _qb_service(
+        self, downloader: Optional[str] = None, config: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        active_config = config or self._config
+        if active_config.get("downloader_mode", self._downloader_mode) == "custom":
+            return self._custom_qb_service(active_config)
         downloader_name = downloader or self._downloader
         if not downloader_name:
             return None, "请先选择一个 qBittorrent 下载器"
@@ -621,6 +769,36 @@ class BrushFlowTracker(_PluginBase):
         if not service:
             return None, f"qBittorrent 下载器 [{downloader_name}] 不存在、未启用或连接失败"
         return service, None
+
+    def _custom_qb_service(self, config: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+        """创建一次性 qBittorrent Web API 适配器，接口与 MoviePilot 下载器保持一致。"""
+        config = config or self._config
+        url = str(config.get("custom_qb_url") or "").strip()
+        host = str(config.get("custom_qb_host") or "").strip()
+        port = int(config.get("custom_qb_port") or 8080)
+        if not url:
+            url = host or "127.0.0.1"
+            if "://" not in url:
+                url = f"http://{url}"
+            if urlsplit(url).port is None:
+                url = f"{url.rstrip('/')}:{port}"
+        try:
+            from qbittorrentapi import Client
+
+            client = Client(
+                host=url,
+                username=str(config.get("custom_qb_username") or ""),
+                password=str(config.get("custom_qb_password") or ""),
+                VERIFY_WEBUI_CERTIFICATE=False,
+                REQUESTS_ARGS={"timeout": (10, self._request_timeout_seconds)},
+            )
+            client.auth_log_in()
+            client.app_version()
+            adapter = _CustomQBAdapter(client, str(config.get("custom_qb_save_path") or "").strip())
+            return SimpleNamespace(name="custom-qBittorrent", instance=adapter), None
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qBittorrent 连接失败：{err}")
+            return None, f"自定义 qBittorrent 连接失败：{err}"
 
     def _downloader_options(self) -> List[Dict[str, str]]:
         try:
@@ -696,7 +874,20 @@ class BrushFlowTracker(_PluginBase):
     @staticmethod
     def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raw_config = copy.deepcopy(config)
+        # 兼容早期/手工配置中常见的 qb_mode、qb_url、qb_path 命名。
+        if "downloader_mode" not in raw_config and raw_config.get("qb_mode"):
+            raw_config["downloader_mode"] = raw_config.get("qb_mode")
+        if "custom_qb_url" not in raw_config and raw_config.get("qb_url"):
+            raw_config["custom_qb_url"] = raw_config.get("qb_url")
+        if "custom_qb_save_path" not in raw_config:
+            raw_config["custom_qb_save_path"] = raw_config.get("custom_qb_path", "")
+        if raw_config.get("downloader_mode") not in {"moviepilot", "custom"}:
+            raw_config["downloader_mode"] = "moviepilot"
         for site in raw_config.get("sites") or []:
+            if "uid" not in site and site.get("site_uid"):
+                site["uid"] = site.get("site_uid")
+            if "passkey" not in site and site.get("site_passkey"):
+                site["passkey"] = site.get("site_passkey")
             for rule in site.get("rss_rules") or []:
                 if "publish_age_to_minutes" not in rule and rule.get("max_age_minutes") is not None:
                     rule["publish_age_from_minutes"] = 0

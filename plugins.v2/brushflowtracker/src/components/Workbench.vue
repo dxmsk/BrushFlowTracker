@@ -23,6 +23,9 @@ const sites = computed(() => draft.value.sites || [])
 const selectedSite = computed(() => sites.value.find(site => site.id === selectedSiteId.value) || null)
 const selectedSummary = computed(() => status.value.sites?.find(site => site.id === selectedSiteId.value) || {})
 const taskNameOptions = computed(() => selectedSite.value?.rss_rules?.map(rule => rule.name).filter(Boolean) || [])
+const downloaderLabel = computed(() => draft.value.downloader_mode === 'custom'
+  ? (draft.value.custom_qb_url || '自定义 qBittorrent')
+  : (draft.value.downloader || '尚未选择下载器'))
 
 const resolutionOptions = ['8K', '4K', '1080P', '1080I', '720P', '576P', '480P']
 const promotionOptions = [
@@ -91,6 +94,8 @@ function addSite() {
     enabled: true,
     use_proxy: false,
     user_agent: '',
+    uid: '',
+    passkey: '',
     rss_rules: [],
     cleanup_rules: [],
   })
@@ -184,7 +189,16 @@ async function runOperation(operation) {
 async function testDownloader() {
   saving.value = true
   try {
-    const data = unwrap(await props.api.post(`${pluginBase}/test-downloader`, { downloader: draft.value.downloader || '' }))
+    const data = unwrap(await props.api.post(`${pluginBase}/test-downloader`, {
+      downloader: draft.value.downloader || '',
+      downloader_mode: draft.value.downloader_mode || 'moviepilot',
+      custom_qb_url: draft.value.custom_qb_url || '',
+      custom_qb_host: draft.value.custom_qb_host || '',
+      custom_qb_port: Number(draft.value.custom_qb_port || 8080),
+      custom_qb_username: draft.value.custom_qb_username || '',
+      custom_qb_password: draft.value.custom_qb_password || '',
+      custom_qb_save_path: draft.value.custom_qb_save_path || '',
+    }))
     notify(`连接正常，当前 ${data.torrent_count} 个任务`)
   } catch (err) {
     notify(err?.message || 'qBittorrent 连接失败', 'error')
@@ -282,7 +296,7 @@ onMounted(() => loadStatus())
                 <VSheet class="stat app-surface-static"><span>最近添加</span><strong>{{ selectedSummary.stats?.added || 0 }}</strong><VIcon icon="mdi-check-circle-outline" color="success" /></VSheet>
               </div>
               <VSheet class="panel app-surface-static">
-                <header class="panel__head"><div><h2>qBittorrent 任务</h2><p>{{ draft.downloader || '尚未选择下载器' }}</p></div><div><VBtn variant="tonal" prepend-icon="mdi-rss" :loading="saving" @click="runOperation('rss')">立即刷新</VBtn><VBtn variant="text" prepend-icon="mdi-broom" :loading="saving" @click="runOperation('cleanup')">检查删种</VBtn></div></header>
+                <header class="panel__head"><div><h2>本插件托管的 qBittorrent 任务</h2><p>{{ downloaderLabel }}</p></div><div><VBtn variant="tonal" prepend-icon="mdi-rss" :loading="saving" @click="runOperation('rss')">立即刷新</VBtn><VBtn variant="text" prepend-icon="mdi-broom" :loading="saving" @click="runOperation('cleanup')">检查删种</VBtn></div></header>
                 <VDataTable :headers="taskHeaders" :items="status.tasks || []" :loading="loading" density="comfortable" class="task-table">
                   <template #item.name="{ item }"><div class="task-name"><strong>{{ item.name }}</strong><small>{{ formatBytes(item.size) }} · {{ item.tags.join(', ') }}</small></div></template>
                   <template #item.progress="{ item }"><div class="progress-cell"><span>{{ item.progress }}%</span><VProgressLinear :model-value="item.progress" height="5" rounded color="primary" /></div></template>
@@ -357,7 +371,15 @@ onMounted(() => loadStatus())
                 <div class="settings-grid">
                   <VSwitch v-model="draft.enabled" label="启用插件" color="success" hide-details inset />
                   <VSwitch v-model="draft.show_sidebar_nav" label="显示侧栏入口" hide-details inset />
-                  <VSelect v-model="draft.downloader" class="span-2" :items="status.downloaders" label="qBittorrent 下载器" placeholder="选择 MoviePilot 中已配置的 qBittorrent" hide-details><template #append><VTooltip text="测试连接"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-connection" variant="text" :loading="saving" @click="testDownloader" /></template></VTooltip></template></VSelect>
+                  <VSelect v-model="draft.downloader_mode" :items="[{ title: 'MoviePilot 内置下载器', value: 'moviepilot' }, { title: '自定义 qBittorrent', value: 'custom' }]" label="qBittorrent 连接方式" hide-details />
+                  <VSelect v-if="draft.downloader_mode !== 'custom'" v-model="draft.downloader" class="span-2" :items="status.downloaders" label="MoviePilot qBittorrent 下载器" placeholder="选择 MoviePilot 中已配置的 qBittorrent" hide-details><template #append><VTooltip text="测试连接"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-connection" variant="text" :loading="saving" @click="testDownloader" /></template></VTooltip></template></VSelect>
+                  <template v-else>
+                    <VTextField v-model="draft.custom_qb_url" label="qBittorrent WebUI 地址" placeholder="http://127.0.0.1:8080" hide-details />
+                    <VTextField v-model="draft.custom_qb_username" label="qBittorrent 用户名" hide-details />
+                    <VTextField v-model="draft.custom_qb_password" type="password" label="qBittorrent 密码" hide-details />
+                    <VTextField v-model="draft.custom_qb_save_path" class="span-2" label="下载保存路径（可选）" placeholder="/downloads 或 D:\\Downloads" hide-details />
+                    <VBtn class="span-2" variant="tonal" prepend-icon="mdi-connection" :loading="saving" @click="testDownloader">测试自定义 qBittorrent 连接</VBtn>
+                  </template>
                   <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="同一影视仅下载最高分辨率" color="primary" hide-details inset />
                   <VTextField v-model.number="draft.rss_interval_minutes" type="number" min="1" label="RSS 刷新间隔（分钟）" hide-details />
                   <VTextField v-model.number="draft.free_monitor_interval_minutes" type="number" min="1" label="免费期检查间隔（分钟）" hide-details />
@@ -366,6 +388,8 @@ onMounted(() => loadStatus())
                   <VTextField v-model.number="draft.history_limit" type="number" min="50" max="5000" label="历史记录上限" hide-details />
                   <VSwitch v-model="selectedSite.use_proxy" label="当前站点 RSS 使用代理" hide-details inset />
                   <VTextField v-model="selectedSite.user_agent" class="span-2" label="当前站点自定义 User-Agent" clearable hide-details />
+                  <VTextField v-model="selectedSite.uid" label="站点 UID（可选）" hint="会自动补到 RSS/详情地址" persistent-hint hide-details="auto" />
+                  <VTextField v-model="selectedSite.passkey" label="站点 Passkey（可选）" hint="用于站点身份识别，降低 403" persistent-hint hide-details="auto" />
                 </div>
                 <div class="settings-actions"><VBtn color="primary" variant="flat" prepend-icon="mdi-content-save" :loading="saving" @click="saveSettings">保存全部设置</VBtn><VBtn variant="tonal" prepend-icon="mdi-timer-refresh-outline" :loading="saving" @click="runOperation('free_monitor')">检查免费期</VBtn></div>
               </VSheet>
