@@ -304,7 +304,7 @@ def test_audiences_detail_lookup_reuses_moviepilot_cookie(plugin_module, monkeyp
     assert captured["url"] == "https://audiences.me/details.php?id=704450&hit=1"
 
 
-def test_global_flush_adds_only_highest_cross_site_resolution(plugin_module):
+def test_flush_keeps_highest_resolution_separately_for_each_site(plugin_module):
     plugin = plugin_module.BrushFlowTracker()
     plugin.init_plugin({})
     downloader = FakeDownloader()
@@ -328,10 +328,61 @@ def test_global_flush_adds_only_highest_cross_site_resolution(plugin_module):
     ]
     result = plugin._flush_pending_candidates(service)
 
+    assert result["added"] == 2
+    assert result["site_dedup"] == 1
+    assert len(downloader.added) == 2
+    assert {row["content"] for row in downloader.added} == {
+        "https://a.example/2160", "https://b.example/2160"
+    }
+
+
+def test_task_label_recovers_managed_torrent_when_qb_name_differs(plugin_module, monkeypatch):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({
+        "downloader": "main-qb",
+        "sites": [{"id": "a", "name": "A", "rss_rules": [{"id": "r", "name": "A任务"}]}],
+    })
+
+    class Tasks:
+        def get_torrents(self):
+            return [{"hash": "RECOVERED", "name": "Torrent internal name", "tags": "A任务", "progress": 0.2}], False
+
+    service = type("Service", (), {"instance": Tasks()})()
+    monkeypatch.setattr(plugin, "_qb_service", lambda *_args, **_kwargs: (service, None))
+    rows, error = plugin._site_torrents(plugin._sites[0])
+    assert error is None
+    assert [row["hash"] for row in rows] == ["RECOVERED"]
+    assert plugin._state["managed"]["recovered"]["recovered"] is True
+
+
+def test_unknown_promotion_is_allowed_without_crawling_detail_page(plugin_module, monkeypatch):
+    now = datetime.now(timezone.utc)
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({
+        "sites": [{
+            "id": "a", "name": "A",
+            "rss_rules": [{
+                "id": "r", "name": "A任务", "url": "https://a.example/rss",
+                "promotion": "free_or_2xfree", "publish_age_from_minutes": 0,
+                "publish_age_to_minutes": 30,
+            }],
+        }],
+    })
+
+    class Feed:
+        def parse(self, **_kwargs):
+            return [{
+                "title": "New Show S01E01 1080P", "enclosure": "https://a.example/download/1",
+                "published_at": now - timedelta(minutes=5),
+            }]
+
+    monkeypatch.setattr(plugin_module, "RssHelper", Feed)
+    monkeypatch.setattr(plugin, "_fetch_detail_promotion", lambda *_args, **_kwargs: pytest.fail("detail page crawled"))
+    downloader = FakeDownloader()
+    service = type("Service", (), {"instance": downloader})()
+    result = plugin._scan_site(plugin._sites[0], service, defer_add=False)
     assert result["added"] == 1
-    assert result["global_dedup"] == 2
-    assert len(downloader.added) == 1
-    assert downloader.added[0]["content"] in {"https://b.example/2160", "https://a.example/2160"}
+    assert result["promotion_unknown_allowed"] == 1
 
 
 def test_pending_plugin_task_is_reconciled_and_only_managed_tasks_are_shown(plugin_module, monkeypatch):

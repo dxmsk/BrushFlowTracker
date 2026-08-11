@@ -129,6 +129,9 @@ def media_key(title: str) -> str:
 def promotion_of(item: Dict[str, Any]) -> str:
     """识别普通、免费和双倍上传免费促销。"""
     fields = list(_iter_fields(item))
+    explicit = str(item.get("promotion") or "").strip().casefold()
+    if explicit in {"normal", "free", "2xfree"}:
+        return explicit
     download_factor = _field_number(fields, {"downloadvolumefactor", "downloadfactor", "downloadmultiplier", "downmultiplier"})
     upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
     free_flag = _field_bool(fields, {"free", "freeleech", "isfree", "isfreeleech"})
@@ -140,6 +143,20 @@ def promotion_of(item: Dict[str, Any]) -> str:
     if is_free:
         return "free"
     return "normal"
+
+
+def promotion_known(item: Dict[str, Any]) -> bool:
+    """判断 RSS 是否明确提供了促销信息，而不是把缺失字段当成普通种。"""
+    fields = list(_iter_fields(item))
+    known_names = {
+        "promotion", "downloadvolumefactor", "downloadfactor", "downloadmultiplier",
+        "downmultiplier", "free", "freeleech", "isfree", "isfreeleech",
+        "freedate", "freeuntil", "freeend", "promotionend",
+    }
+    if any(key in known_names for key, _value in fields):
+        return True
+    text = " ".join(str(value or "") for key, value in fields if key in {"title", "description"})
+    return bool(FREE_MARKER.search(text) or TWO_X_MARKER.search(text))
 
 
 def free_until_of(item: Dict[str, Any], now: Optional[datetime] = None) -> Optional[datetime]:
@@ -172,7 +189,12 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
     """把 MoviePilot RSS 结果标准化为选种流程使用的字段。"""
     title = str(raw.get("title") or "").strip()
     resolution, rank = detect_resolution(title)
-    pubdate = parse_datetime(raw.get("pubdate") or raw.get("published"), now)
+    fields = list(_iter_fields(raw))
+    pubdate_value = _field_value(
+        fields,
+        {"pubdate", "published", "publishedat", "publicationdate", "createdat", "addedat", "date", "updated", "timestamp"},
+    )
+    pubdate = parse_datetime(pubdate_value, now)
     promotion = promotion_of(raw)
     free_until = free_until_of(raw, now)
     # 有些站点只在描述中输出“剩余时间”，不输出 FREE 标签或下载因子。
@@ -187,12 +209,13 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         **raw,
         "title": title,
         "enclosure": enclosure,
-        "size": int(_number(raw.get("size"), 0) or 0),
+        "size": int(_number(_field_value(fields, {"size", "length", "filesize", "contentlength"}), 0) or 0),
         "pubdate": pubdate,
         "resolution": resolution,
         "resolution_rank": rank,
         "media_key": media_key(title),
         "promotion": promotion,
+        "promotion_known": promotion_known(raw) or bool(free_until),
         "free_until": free_until,
     }
 
@@ -227,8 +250,9 @@ def match_rule(item: Dict[str, Any], rule: Dict[str, Any], now: Optional[datetim
     if age_from is not None or age_to is not None:
         if not pubdate:
             return False, "缺少发种时间，无法判断范围"
-        age_minutes = max((reference - pubdate).total_seconds() / 60, 0)
-        if (age_from is not None and age_minutes < age_from) or (age_to is not None and age_minutes > age_to):
+        age_minutes = (reference - pubdate).total_seconds() / 60
+        lower_bound = age_from if age_from is not None else 0
+        if age_minutes < lower_bound or (age_to is not None and age_minutes > age_to):
             return False, "发种时间不在范围"
     promotion_filter = rule.get("promotion", "any")
     if promotion_filter == "free" and item.get("promotion") != "free":
@@ -321,6 +345,13 @@ def _field_number(fields: Iterable[Tuple[str, Any]], names: set[str]) -> Optiona
             number = _number(value, None)
             if number is not None:
                 return number
+    return None
+
+
+def _field_value(fields: Iterable[Tuple[str, Any]], names: set[str]) -> Any:
+    for key, value in fields:
+        if key in names and value not in (None, ""):
+            return value
     return None
 
 

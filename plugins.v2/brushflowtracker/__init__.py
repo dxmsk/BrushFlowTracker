@@ -103,7 +103,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -231,6 +231,7 @@ class BrushFlowTracker(_PluginBase):
         downloader_error = None
         if selected:
             tasks, downloader_error = self._site_torrents(selected)
+            sites = [self._site_summary(site) for site in self._sites]
         return schemas.Response(
             success=True,
             data={
@@ -321,6 +322,7 @@ class BrushFlowTracker(_PluginBase):
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
             self._reconcile_pending_managed(service, torrents)
+            self._recover_managed_by_tags(torrents)
             torrent_map = {str(item.get("hash") or "").lower(): item for item in torrents or []}
             now = datetime.now().astimezone()
             for torrent_hash, record in list(self._state["managed"].items()):
@@ -368,6 +370,7 @@ class BrushFlowTracker(_PluginBase):
             if failed:
                 raise RuntimeError("读取 qBittorrent 任务失败")
             self._reconcile_pending_managed(service, torrents)
+            self._recover_managed_by_tags(torrents)
             for site in self._target_sites(site_id):
                 rules = site.get("cleanup_rules") or []
                 if not rules:
@@ -427,11 +430,15 @@ class BrushFlowTracker(_PluginBase):
                             result[f"filtered:{pre_reason}"] += 1
                             self._log_selection(site, rule, item, "排除", pre_reason)
                             continue
-                        if item.get("promotion") == "normal":
-                            detail = self._fetch_detail_promotion(auth_site, raw, now)
-                            if detail:
-                                item = normalize_item({**raw, **detail}, now)
-                    matched, reason = match_rule(item, rule, now)
+                    effective_rule = rule
+                    if promotion_filter in {"free", "free_or_2xfree", "2xfree"} and not item.get("promotion_known"):
+                        effective_rule = {**rule, "promotion": "any"}
+                        result["promotion_unknown_allowed"] += 1
+                        logger.info(
+                            f"刷流追新无法确认免费状态，按其他筛选条件继续：站点={site.get('name')} | "
+                            f"任务={rule.get('name')} | 名称={item.get('title')} | 链接={item.get('enclosure')}"
+                        )
+                    matched, reason = match_rule(item, effective_rule, now)
                     if not matched:
                         result[f"filtered:{reason}"] += 1
                         self._log_selection(site, rule, item, "排除", reason)
@@ -453,7 +460,7 @@ class BrushFlowTracker(_PluginBase):
                         self._log_selection(site, rule, item, "排除", "下载链接已处理")
                         continue
                     if self._highest_resolution_dedup:
-                        if not dedup_allows(item, self._state["dedup_records"]):
+                        if not self._site_dedup_allows(site["id"], item):
                             result["lower_resolution"] += 1
                             self._log_selection(site, rule, item, "排除", "不高于已下载画质")
                             continue
@@ -465,7 +472,7 @@ class BrushFlowTracker(_PluginBase):
                         self._log_selection(site, rule, item, "添加", "符合全部条件")
                         self._state["processed_urls"][url_key] = isoformat(now)
                         if self._highest_resolution_dedup and not rule.get("resolutions"):
-                            self._state["dedup_records"][item["media_key"]] = {
+                            self._state["dedup_records"][self._site_media_key(site["id"], item)] = {
                                 "title": item["title"],
                                 "resolution": item["resolution"],
                                 "resolution_rank": item["resolution_rank"],
@@ -480,8 +487,16 @@ class BrushFlowTracker(_PluginBase):
         site_stats.update({"last_rss_at": isoformat(datetime.now().astimezone()), **dict(result)})
         return result
 
+    @staticmethod
+    def _site_media_key(site_id: str, item: Dict[str, Any]) -> str:
+        return f"{site_id}:{item.get('media_key') or item.get('enclosure') or ''}"
+
+    def _site_dedup_allows(self, site_id: str, item: Dict[str, Any]) -> bool:
+        scoped_item = {**item, "media_key": self._site_media_key(site_id, item)}
+        return dedup_allows(scoped_item, self._state["dedup_records"])
+
     def _flush_pending_candidates(self, service: Any) -> Counter:
-        """跨站点汇总候选，只添加每个影视身份的最高画质一个条目。"""
+        """按站点汇总候选，每个站点的同一影视只添加最高画质条目。"""
         result = Counter()
         pending = list(getattr(self, "_pending_candidates", []) or [])
         self._pending_candidates = []
@@ -492,25 +507,25 @@ class BrushFlowTracker(_PluginBase):
             if not self._highest_resolution_dedup:
                 break
             item = record["item"]
-            key = str(item.get("media_key") or item.get("enclosure") or "")
+            key = self._site_media_key(record["site"]["id"], item)
             previous = selected.get(key)
             if previous is None or int(item.get("resolution_rank") or 0) > int(previous["item"].get("resolution_rank") or 0):
                 if previous is not None:
-                    result["global_dedup"] += 1
-                    self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "跨站点同一影视已保留更高分辨率版本")
+                    result["site_dedup"] += 1
+                    self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "同站点同一影视已保留更高分辨率版本")
                 selected[key] = record
             else:
-                result["global_dedup"] += 1
-                self._log_selection(record["site"], record["rule"], item, "排除", "跨站点同一影视已保留更高或同等分辨率版本")
+                result["site_dedup"] += 1
+                self._log_selection(record["site"], record["rule"], item, "排除", "同站点同一影视已保留更高或同等分辨率版本")
 
         for record in selected.values():
             site, rule, item = record["site"], record["rule"], record["item"]
             if self._add_item(site, rule, item, service):
                 result["added"] += 1
-                self._log_selection(site, rule, item, "添加", "符合全部条件且为全站点最高画质")
+                self._log_selection(site, rule, item, "添加", "符合全部条件且为当前站点最高画质")
                 self._state["processed_urls"][record["url_key"]] = isoformat(record["now"])
                 if self._highest_resolution_dedup:
-                    self._state["dedup_records"][item["media_key"]] = {
+                    self._state["dedup_records"][self._site_media_key(site["id"], item)] = {
                         "title": item["title"],
                         "resolution": item["resolution"],
                         "resolution_rank": item["resolution_rank"],
@@ -567,9 +582,11 @@ class BrushFlowTracker(_PluginBase):
             text = unescape(re.sub(r"<[^>]+>", " ", html))
             detail_item = {"title": raw.get("title", ""), "description": text}
             promotion = normalize_item({**detail_item, "enclosure": raw.get("enclosure") or raw.get("link")}, now)
-            if promotion.get("promotion") == "normal":
-                return None
-            return {"promotion": promotion["promotion"], "free_until": promotion.get("free_until")}
+            return {
+                "promotion": promotion["promotion"],
+                "free_until": promotion.get("free_until"),
+                "promotion_known": True,
+            }
         except Exception as err:
             logger.debug(f"刷流追新读取详情页免费状态失败：{detail_url}，{str(err)}")
             return None
@@ -722,6 +739,7 @@ class BrushFlowTracker(_PluginBase):
     def _find_added_hashes(self, service: Any, task_name: str, title: str) -> List[str]:
         # 不依赖 qB 的 tag 过滤参数（旧版 MoviePilot/qB 对 tags 参数支持不一致），
         # 先取全部任务，再按本插件设置的任务标签和名称匹配。
+        fallback_matches = []
         for _attempt in range(3):
             torrents, failed = service.instance.get_torrents()
             if not failed:
@@ -729,14 +747,18 @@ class BrushFlowTracker(_PluginBase):
                 for item in torrents or []:
                     tags = set(split_terms(item.get("tags")))
                     name = str(item.get("name") or "").strip()
-                    if task_name in tags and (name == title.strip() or title.strip() in name or name in title.strip()):
+                    if task_name not in tags:
+                        continue
+                    fallback_matches.append(item)
+                    if name == title.strip() or title.strip() in name or name in title.strip():
                         matches.append(item)
                 matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
                 if matches:
                     return [str(matches[0].get("hash") or "").lower()]
             if _attempt < 2:
                 time.sleep(0.4)
-        return []
+        fallback_matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
+        return [str(fallback_matches[0].get("hash") or "").lower()] if fallback_matches else []
 
     def _site_torrents(self, site: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         service, error = self._qb_service()
@@ -746,6 +768,9 @@ class BrushFlowTracker(_PluginBase):
         if failed:
             return [], "读取 qBittorrent 任务失败"
         self._reconcile_pending_managed(service, torrents)
+        self._recover_managed_by_tags(torrents)
+        site_labels = {str(rule.get("name") or "").strip() for rule in site.get("rss_rules") or []}
+        site_labels.discard("")
         managed_hashes = {
             torrent_hash
             for torrent_hash, record in self._state["managed"].items()
@@ -767,7 +792,45 @@ class BrushFlowTracker(_PluginBase):
             }
             for item in torrents or []
             if str(item.get("hash") or "").lower() in managed_hashes
+            or bool(site_labels.intersection(split_terms(item.get("tags"))))
         ], None
+
+    def _recover_managed_by_tags(self, torrents: List[Dict[str, Any]]) -> None:
+        """用任务名称标签恢复旧版本未保存成功的托管 hash。"""
+        label_rules: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+        for site in self._sites:
+            for rule in site.get("rss_rules") or []:
+                label = str(rule.get("name") or "").strip()
+                if label:
+                    label_rules.setdefault(label, []).append((site, rule))
+        changed = False
+        for torrent in torrents or []:
+            torrent_hash = str(torrent.get("hash") or "").lower()
+            if not torrent_hash or torrent_hash in self._state["managed"]:
+                continue
+            matches = []
+            for tag in split_terms(torrent.get("tags")):
+                matches.extend(label_rules.get(tag) or [])
+            site_ids = {matched_site["id"] for matched_site, _rule in matches}
+            if len(site_ids) != 1 or not matches:
+                continue
+            matched_site, matched_rule = matches[0]
+            self._state["managed"][torrent_hash] = {
+                "site_id": matched_site["id"],
+                "site_name": matched_site["name"],
+                "rule_id": matched_rule["id"],
+                "rule_name": matched_rule.get("name"),
+                "title": torrent.get("name"),
+                "resolution": None,
+                "promotion": "unknown",
+                "free_until": None,
+                "tags": split_terms(torrent.get("tags")),
+                "added_at": isoformat(datetime.now().astimezone()),
+                "recovered": True,
+            }
+            changed = True
+        if changed:
+            self._save_state()
 
     def _reconcile_pending_managed(
         self, service: Any, torrents: Optional[List[Dict[str, Any]]] = None

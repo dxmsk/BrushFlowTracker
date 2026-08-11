@@ -161,3 +161,20 @@ def test_cleanup_matches_any_selected_task_label():
     torrent = {"tags": "任务 B", "ratio": 2, "seeding_time": 5 * 3600}
     rules = [{"id": "match", "enabled": True, "labels": ["任务 A", "任务 B"], "min_seed_hours": 1, "min_ratio": 1}]
     assert core.first_cleanup_rule(torrent, rules)["id"] == "match"
+
+
+def test_normalize_item_reads_common_rss_publish_time_fields():
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    item = core.normalize_item(
+        {"title": "Example", "enclosure": "https://x/t", "published_at": now - timedelta(minutes=12)},
+        now,
+    )
+    assert item["pubdate"] == now - timedelta(minutes=12)
+    assert core.match_rule(item, {"publish_age_from_minutes": 0, "publish_age_to_minutes": 30}, now)[0] is True
+
+
+def test_promotion_known_distinguishes_missing_from_explicit_normal_factor():
+    unknown = core.normalize_item({"title": "Example", "enclosure": "https://x/u"})
+    normal = core.normalize_item({"title": "Example", "enclosure": "https://x/n", "downloadfactor": 1})
+    assert unknown["promotion_known"] is False
+    assert normal["promotion_known"] is True
