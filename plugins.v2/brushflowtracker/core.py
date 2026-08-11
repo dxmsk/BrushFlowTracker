@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -109,7 +110,17 @@ def detect_resolution(title: str) -> Tuple[str, int]:
 
 def media_key(title: str) -> str:
     """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
-    text = (title or "").upper()
+    text = unicodedata.normalize("NFKC", title or "").upper()
+    episode = re.search(r"(?<![A-Z0-9])S\d{1,3}E\d{1,4}(?:E\d{1,4})*(?!\d)", text)
+    if episode:
+        text = text[:episode.end()]
+    else:
+        resolution = re.search(
+            r"(?<!\d)(?:8K|4K|UHD|4320P|2160[PI]|1080[PI]|720P|576P|480P)(?!\d)",
+            text,
+        )
+        if resolution and resolution.start() > 2:
+            text = text[:resolution.start()]
     text = re.sub(
         r"\b(?:8K|4K|UHD|2160[PI]|1080[PI]|720P|576P|480P|"
         r"BLU-?RAY|REMUX|WEB-?DL|WEBRIP|HDTV|BDRIP|DVDRIP|"
@@ -119,11 +130,71 @@ def media_key(title: str) -> str:
         text,
     )
     text = re.sub(r"\b(?:PROPER|REPACK|EXTENDED|UNCUT|MULTI|CHS|CHT)\b", " ", text)
-    text = re.sub(r"[._\-\[\](){}【】]+", " ", text)
+    # Collapse every punctuation/separator variant, including RSS metadata pipes.
+    text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         text = title.strip().upper()
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
+
+
+def quality_rank(title: str, resolution_rank: Optional[int] = None) -> int:
+    """Return a quality score with resolution as the strongest signal."""
+    text = unicodedata.normalize("NFKC", title or "").upper()
+    rank = int(resolution_rank if resolution_rank is not None else detect_resolution(text)[1])
+    score = rank * 1_000_000
+
+    if re.search(r"\b(?:DOLBY\s*VISION|DOVI|DV)\b", text):
+        score += 40_000
+    elif re.search(r"\bHDR10\+|\bHDR10PLUS\b", text):
+        score += 30_000
+    elif re.search(r"\bHDR10\b", text):
+        score += 20_000
+    elif re.search(r"\bHDR\b", text):
+        score += 15_000
+
+    if re.search(r"\bREMUX\b", text):
+        score += 5_000
+    elif re.search(r"\b(?:BLU-?RAY|BDRIP)\b", text):
+        score += 4_000
+    elif re.search(r"\bWEB-?DL\b", text):
+        score += 3_000
+    elif re.search(r"\bWEBRIP\b", text):
+        score += 2_000
+    elif re.search(r"\bHDTV\b", text):
+        score += 1_000
+
+    if re.search(r"\bAV1\b", text):
+        score += 900
+    elif re.search(r"\b(?:X265|H265|H\.265|HEVC)\b", text):
+        score += 800
+    elif re.search(r"\b(?:X264|H264|H\.264|AVC)\b", text):
+        score += 600
+    if re.search(r"\b(?:10\s*BIT|10BIT)\b", text):
+        score += 200
+
+    if re.search(r"\bTRUEHD\b.*\bATMOS\b|\bATMOS\b.*\bTRUEHD\b", text):
+        score += 90
+    elif re.search(r"\bDTS-?HD\b", text):
+        score += 80
+    elif re.search(r"\b(?:DDP(?:\d(?:\.\d)?)?|E-?AC-?3)\b", text):
+        score += 60
+    elif re.search(r"\bDTS\b", text):
+        score += 50
+    elif re.search(r"\bAAC\b", text):
+        score += 20
+    return score
+
+
+def item_quality_rank(item: Dict[str, Any]) -> int:
+    """Read a normalized score while remaining compatible with old records."""
+    stored = item.get("quality_rank")
+    if stored is not None:
+        try:
+            return int(stored)
+        except (TypeError, ValueError):
+            pass
+    return quality_rank(str(item.get("title") or ""), int(item.get("resolution_rank") or 0))
 
 
 def promotion_of(item: Dict[str, Any]) -> str:
@@ -213,6 +284,7 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         "pubdate": pubdate,
         "resolution": resolution,
         "resolution_rank": rank,
+        "quality_rank": quality_rank(title, rank),
         "media_key": media_key(title),
         "promotion": promotion,
         "promotion_known": promotion_known(raw) or bool(free_until),
@@ -273,7 +345,7 @@ def choose_highest(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if key not in chosen:
             chosen[key] = item
             order.append(key)
-        elif int(item.get("resolution_rank") or 0) > int(chosen[key].get("resolution_rank") or 0):
+        elif item_quality_rank(item) > item_quality_rank(chosen[key]):
             chosen[key] = item
     return [chosen[key] for key in order]
 
@@ -283,7 +355,7 @@ def dedup_allows(item: Dict[str, Any], records: Dict[str, Dict[str, Any]]) -> bo
     record = records.get(str(item.get("media_key") or ""))
     if not record:
         return True
-    return int(item.get("resolution_rank") or 0) > int(record.get("resolution_rank") or 0)
+    return item_quality_rank(item) > item_quality_rank(record)
 
 
 def torrent_tags(torrent: Dict[str, Any]) -> List[str]:

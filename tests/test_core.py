@@ -25,6 +25,23 @@ def test_media_key_ignores_release_quality_but_keeps_episode_identity():
     assert first != next_episode
 
 
+def test_same_episode_hdr_and_sdr_share_identity_and_hdr_wins():
+    hdr_title = (
+        "The Mystic Nine S01E23 2026 2160p WEB-DL H265 HDR DTS-ADWeb "
+        "[The Mystic Nine | Chinese | HDR10 | Official]"
+    )
+    sdr_title = (
+        "The Mystic Nine S01E23 2026 2160p WEB-DL H265 DTS-ADWeb "
+        "[The Mystic Nine | Chinese | Official]"
+    )
+    hdr = core.normalize_item({"title": hdr_title, "enclosure": "https://x/hdr"})
+    sdr = core.normalize_item({"title": sdr_title, "enclosure": "https://x/sdr"})
+
+    assert hdr["media_key"] == sdr["media_key"]
+    assert hdr["quality_rank"] > sdr["quality_rank"]
+    assert core.choose_highest([sdr, hdr]) == [hdr]
+
+
 def test_promotion_recognizes_structured_and_text_markers():
     assert core.promotion_of({"downloadvolumefactor": 0, "uploadvolumefactor": 1}) == "free"
     assert core.promotion_of({"title": "[2X FREE] Example"}) == "2xfree"

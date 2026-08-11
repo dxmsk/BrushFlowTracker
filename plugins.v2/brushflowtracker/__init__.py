@@ -28,6 +28,7 @@ from .core import (
     choose_highest,
     dedup_allows,
     first_cleanup_rule,
+    item_quality_rank,
     isoformat,
     match_rule,
     normalize_item,
@@ -103,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.8"
+    plugin_version = "1.1.9"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -142,6 +143,8 @@ class BrushFlowTracker(_PluginBase):
             "site_stats": dict(state.get("site_stats") or {}),
             "last_runs": dict(state.get("last_runs") or {}),
         }
+        if self._highest_resolution_dedup and self._migrate_managed_dedup_records():
+            self._save_state()
         if raw_config != normalized:
             self.update_config(normalized)
 
@@ -483,6 +486,7 @@ class BrushFlowTracker(_PluginBase):
                                 "title": item["title"],
                                 "resolution": item["resolution"],
                                 "resolution_rank": item["resolution_rank"],
+                                "quality_rank": item["quality_rank"],
                                 "updated_at": isoformat(now),
                             }
                     else:
@@ -513,6 +517,32 @@ class BrushFlowTracker(_PluginBase):
             **dict(result),
         }
 
+    def _migrate_managed_dedup_records(self) -> bool:
+        """Seed new identity keys from managed tasks without touching qB data."""
+        changed = False
+        records = list(self._state.get("managed", {}).values()) + list(
+            self._state.get("pending_managed", [])
+        )
+        for managed in records:
+            site_id = str(managed.get("site_id") or "").strip()
+            title = str(managed.get("title") or "").strip()
+            if not site_id or not title:
+                continue
+            item = normalize_item({"title": title})
+            key = self._site_media_key(site_id, item)
+            candidate = {
+                "title": title,
+                "resolution": item["resolution"],
+                "resolution_rank": item["resolution_rank"],
+                "quality_rank": item["quality_rank"],
+                "updated_at": managed.get("added_at") or isoformat(datetime.now().astimezone()),
+            }
+            existing = self._state["dedup_records"].get(key)
+            if existing is None or item_quality_rank(candidate) > item_quality_rank(existing):
+                self._state["dedup_records"][key] = candidate
+                changed = True
+        return changed
+
     @staticmethod
     def _site_media_key(site_id: str, item: Dict[str, Any]) -> str:
         return f"{site_id}:{item.get('media_key') or item.get('enclosure') or ''}"
@@ -535,7 +565,7 @@ class BrushFlowTracker(_PluginBase):
             item = record["item"]
             key = self._site_media_key(record["site"]["id"], item)
             previous = selected.get(key)
-            if previous is None or int(item.get("resolution_rank") or 0) > int(previous["item"].get("resolution_rank") or 0):
+            if previous is None or item_quality_rank(item) > item_quality_rank(previous["item"]):
                 if previous is not None:
                     result["site_dedup"] += 1
                     previous.get("site_result", Counter())["site_dedup"] += 1
@@ -558,6 +588,7 @@ class BrushFlowTracker(_PluginBase):
                         "title": item["title"],
                         "resolution": item["resolution"],
                         "resolution_rank": item["resolution_rank"],
+                        "quality_rank": item["quality_rank"],
                         "updated_at": isoformat(record["now"]),
                     }
             else:
@@ -723,6 +754,7 @@ class BrushFlowTracker(_PluginBase):
         if not hashes:
             hashes = self._find_added_hashes(service, task_name, item["title"])
         now = datetime.now().astimezone()
+        identity = normalize_item(item, now)
         record = {
             "site_id": site["id"],
             "site_name": site["name"],
@@ -731,6 +763,9 @@ class BrushFlowTracker(_PluginBase):
             "title": item["title"],
             "link": item.get("link") or item.get("enclosure"),
             "resolution": item["resolution"],
+            "resolution_rank": item.get("resolution_rank", identity["resolution_rank"]),
+            "quality_rank": item.get("quality_rank", identity["quality_rank"]),
+            "media_key": item.get("media_key", identity["media_key"]),
             "promotion": item["promotion"],
             "free_until": isoformat(item.get("free_until")),
             "tags": tags,
@@ -860,6 +895,7 @@ class BrushFlowTracker(_PluginBase):
             }
             changed = True
         if changed:
+            self._migrate_managed_dedup_records()
             self._save_state()
 
     def _reconcile_pending_managed(

@@ -336,6 +336,36 @@ def test_flush_keeps_highest_resolution_separately_for_each_site(plugin_module):
     }
 
 
+def test_flush_keeps_hdr_when_same_site_episode_has_two_4k_releases(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    downloader = FakeDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    site = {"id": "a", "name": "Site A"}
+    rule = {"id": "ra", "name": "Task A"}
+
+    def candidate(title, url):
+        return {
+            "site": site,
+            "rule": rule,
+            "item": plugin_module.normalize_item({"title": title, "enclosure": url}, now),
+            "url_key": url,
+            "now": now,
+        }
+
+    base = "The Mystic Nine S01E23 2026 2160p WEB-DL H265 DTS-ADWeb"
+    plugin._pending_candidates = [
+        candidate(f"{base} [Chinese | Official]", "https://a.example/sdr"),
+        candidate(f"{base} HDR [Chinese | HDR10 | Official]", "https://a.example/hdr"),
+    ]
+    result = plugin._flush_pending_candidates(service)
+
+    assert result["added"] == 1
+    assert result["site_dedup"] == 1
+    assert [row["content"] for row in downloader.added] == ["https://a.example/hdr"]
+
+
 def test_task_label_recovers_managed_torrent_when_qb_name_differs(plugin_module, monkeypatch):
     plugin = plugin_module.BrushFlowTracker()
     plugin.init_plugin({
