@@ -380,9 +380,15 @@ def test_unknown_promotion_is_allowed_without_crawling_detail_page(plugin_module
     monkeypatch.setattr(plugin, "_fetch_detail_promotion", lambda *_args, **_kwargs: pytest.fail("detail page crawled"))
     downloader = FakeDownloader()
     service = type("Service", (), {"instance": downloader})()
-    result = plugin._scan_site(plugin._sites[0], service, defer_add=False)
+    monkeypatch.setattr(plugin, "_qb_service", lambda *_args, **_kwargs: (service, None))
+    result = plugin.run_rss("a")
     assert result["added"] == 1
     assert result["promotion_unknown_allowed"] == 1
+    assert plugin._state["site_stats"]["a"]["fetched"] == 1
+    assert plugin._state["site_stats"]["a"]["added"] == 1
+    plugin.run_rss("a")
+    assert plugin._state["site_stats"]["a"]["fetched"] == 1
+    assert plugin._state["site_stats"]["a"]["added"] == 0
 
 
 def test_pending_plugin_task_is_reconciled_and_only_managed_tasks_are_shown(plugin_module, monkeypatch):

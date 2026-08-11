@@ -189,10 +189,17 @@ async function runOperation(operation) {
   try {
     unwrap(await props.api.post(`${pluginBase}/run`, { operation, site_id: selectedSiteId.value || null }))
     notify('任务已提交到后台')
+    scheduleStatusRefresh()
   } catch (err) {
     notify(err?.message || '提交任务失败', 'error')
   } finally {
     saving.value = false
+  }
+}
+
+function scheduleStatusRefresh() {
+  for (const delay of [1500, 4000, 8000, 15000]) {
+    globalThis.setTimeout(() => loadStatus(true), delay)
   }
 }
 

@@ -103,7 +103,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -292,10 +292,15 @@ class BrushFlowTracker(_PluginBase):
             if error:
                 raise RuntimeError(error)
             self._pending_candidates = []
-            for site in self._target_sites(site_id):
+            target_sites = self._target_sites(site_id)
+            site_results: Dict[str, Counter] = {}
+            for site in target_sites:
                 site_result = self._scan_site(site, service, defer_add=True)
+                site_results[site["id"]] = site_result
                 summary.update(site_result)
             summary.update(self._flush_pending_candidates(service))
+            for site in target_sites:
+                self._update_site_rss_stats(site["id"], site_results.get(site["id"], Counter()))
             self._record_run("rss", site_id, started, dict(summary), None)
             logger.info(f"刷流追新 RSS 完成：读取 {summary['fetched']}，命中 {summary['matched']}，添加 {summary['added']}")
             return dict(summary)
@@ -401,7 +406,6 @@ class BrushFlowTracker(_PluginBase):
 
     def _scan_site(self, site: Dict[str, Any], service: Any, defer_add: bool = False) -> Counter:
         result = Counter()
-        site_stats = self._state["site_stats"].setdefault(site["id"], {})
         for rule in site.get("rss_rules") or []:
             if not rule.get("enabled") or not rule.get("url"):
                 continue
@@ -465,7 +469,10 @@ class BrushFlowTracker(_PluginBase):
                             self._log_selection(site, rule, item, "排除", "不高于已下载画质")
                             continue
                     if defer_add:
-                        self._pending_candidates.append({"site": site, "rule": rule, "item": item, "url_key": url_key, "now": now})
+                        self._pending_candidates.append({
+                            "site": site, "rule": rule, "item": item, "url_key": url_key,
+                            "now": now, "site_result": result,
+                        })
                         continue
                     if self._add_item(site, rule, item, service):
                         result["added"] += 1
@@ -484,8 +491,27 @@ class BrushFlowTracker(_PluginBase):
             except Exception as err:
                 result["rule_errors"] += 1
                 logger.error(f"刷流追新站点 [{site['name']}] 规则 [{rule.get('name')}] 失败：{str(err)}")
-        site_stats.update({"last_rss_at": isoformat(datetime.now().astimezone()), **dict(result)})
+        if not defer_add:
+            self._update_site_rss_stats(site["id"], result)
         return result
+
+    def _update_site_rss_stats(self, site_id: str, result: Counter) -> None:
+        defaults = {
+            "fetched": 0,
+            "matched": 0,
+            "added": 0,
+            "duplicate": 0,
+            "lower_resolution": 0,
+            "site_dedup": 0,
+            "add_failed": 0,
+            "rule_errors": 0,
+            "promotion_unknown_allowed": 0,
+        }
+        self._state["site_stats"][site_id] = {
+            "last_rss_at": isoformat(datetime.now().astimezone()),
+            **defaults,
+            **dict(result),
+        }
 
     @staticmethod
     def _site_media_key(site_id: str, item: Dict[str, Any]) -> str:
@@ -512,16 +538,19 @@ class BrushFlowTracker(_PluginBase):
             if previous is None or int(item.get("resolution_rank") or 0) > int(previous["item"].get("resolution_rank") or 0):
                 if previous is not None:
                     result["site_dedup"] += 1
+                    previous.get("site_result", Counter())["site_dedup"] += 1
                     self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "同站点同一影视已保留更高分辨率版本")
                 selected[key] = record
             else:
                 result["site_dedup"] += 1
+                record.get("site_result", Counter())["site_dedup"] += 1
                 self._log_selection(record["site"], record["rule"], item, "排除", "同站点同一影视已保留更高或同等分辨率版本")
 
         for record in selected.values():
             site, rule, item = record["site"], record["rule"], record["item"]
             if self._add_item(site, rule, item, service):
                 result["added"] += 1
+                record.get("site_result", Counter())["added"] += 1
                 self._log_selection(site, rule, item, "添加", "符合全部条件且为当前站点最高画质")
                 self._state["processed_urls"][record["url_key"]] = isoformat(record["now"])
                 if self._highest_resolution_dedup:
@@ -533,6 +562,7 @@ class BrushFlowTracker(_PluginBase):
                     }
             else:
                 result["add_failed"] += 1
+                record.get("site_result", Counter())["add_failed"] += 1
                 self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
         return result
 
