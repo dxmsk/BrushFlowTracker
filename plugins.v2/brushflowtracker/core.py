@@ -111,7 +111,11 @@ def detect_resolution(title: str) -> Tuple[str, int]:
 def media_key(title: str) -> str:
     """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
     text = unicodedata.normalize("NFKC", title or "").upper()
-    episode = re.search(r"(?<![A-Z0-9])S\d{1,3}E\d{1,4}(?:E\d{1,4})*(?!\d)", text)
+    full_text = text
+    episode = re.search(
+        r"(?<![A-Z0-9])S\d{1,3}E\d{1,4}(?:\s*[-~]?\s*E\d{1,4})*(?!\d)",
+        text,
+    )
     if episode:
         text = text[:episode.end()]
     else:
@@ -121,6 +125,15 @@ def media_key(title: str) -> str:
         )
         if resolution and resolution.start() > 2:
             text = text[:resolution.start()]
+        chinese_episode = re.search(
+            r"第\s*0*(\d{1,4})\s*(?:[-~至到]\s*0*(\d{1,4}))?\s*[集话話期]",
+            full_text,
+        )
+        if chinese_episode:
+            start, end = chinese_episode.groups()
+            text = f"{text} EPISODE {int(start)}"
+            if end:
+                text = f"{text} TO {int(end)}"
     text = re.sub(
         r"\b(?:8K|4K|UHD|2160[PI]|1080[PI]|720P|576P|480P|"
         r"BLU-?RAY|REMUX|WEB-?DL|WEBRIP|HDTV|BDRIP|DVDRIP|"
@@ -195,6 +208,12 @@ def item_quality_rank(item: Dict[str, Any]) -> int:
         except (TypeError, ValueError):
             pass
     return quality_rank(str(item.get("title") or ""), int(item.get("resolution_rank") or 0))
+
+
+def item_preference(item: Dict[str, Any]) -> Tuple[int, int]:
+    """Rank by detected quality first, then prefer the larger torrent."""
+    size = max(0, int(_number(item.get("size"), 0) or 0))
+    return item_quality_rank(item), size
 
 
 def promotion_of(item: Dict[str, Any]) -> str:
@@ -345,7 +364,7 @@ def choose_highest(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if key not in chosen:
             chosen[key] = item
             order.append(key)
-        elif item_quality_rank(item) > item_quality_rank(chosen[key]):
+        elif item_preference(item) > item_preference(chosen[key]):
             chosen[key] = item
     return [chosen[key] for key in order]
 
@@ -355,7 +374,7 @@ def dedup_allows(item: Dict[str, Any], records: Dict[str, Dict[str, Any]]) -> bo
     record = records.get(str(item.get("media_key") or ""))
     if not record:
         return True
-    return item_quality_rank(item) > item_quality_rank(record)
+    return item_preference(item) > item_preference(record)
 
 
 def torrent_tags(torrent: Dict[str, Any]) -> List[str]:

@@ -232,6 +232,14 @@ function formatBytes(value) {
   return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`
 }
 
+function historyMeta(row) {
+  const parts = row.reason
+    ? [row.reason]
+    : [row.rule_name || 'RSS 任务', row.resolution || '未知画质']
+  if (Number(row.size || 0) > 0) parts.push(formatBytes(row.size))
+  return parts.join(' · ')
+}
+
 function formatTime(value) {
   if (!value) return '-'
   const date = new Date(value)
@@ -379,7 +387,7 @@ onMounted(() => loadStatus())
             </VWindowItem>
 
             <VWindowItem value="history">
-              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果；点击种子名称进入站点详情页</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><a v-if="row.link" :href="row.link" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><strong v-else>{{ row.title }}</strong><span>{{ row.reason || `${row.rule_name || 'RSS 任务'} · ${row.resolution || '未知画质'}` }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
+              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果；点击种子名称进入站点详情页</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><a v-if="row.link" :href="row.link" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><strong v-else>{{ row.title }}</strong><span>{{ historyMeta(row) }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
             </VWindowItem>
 
             <VWindowItem value="settings">
@@ -397,7 +405,7 @@ onMounted(() => loadStatus())
                     <VTextField v-model="draft.custom_qb_save_path" class="span-2" label="下载保存路径（可选）" placeholder="/downloads 或 D:\\Downloads" hide-details />
                     <VBtn class="span-2" variant="tonal" prepend-icon="mdi-connection" :loading="saving" @click="testDownloader">测试自定义 qBittorrent 连接</VBtn>
                   </template>
-                  <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="同一影视仅下载最高分辨率" color="primary" hide-details inset />
+                  <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="所有站点同一资源只保留最佳画质，同画质保留最大体积" color="primary" hide-details inset />
                   <VTextField v-model.number="draft.rss_interval_minutes" type="number" min="1" label="RSS 刷新间隔（分钟）" hide-details />
                   <VTextField v-model.number="draft.free_monitor_interval_minutes" type="number" min="1" label="免费期检查间隔（分钟）" hide-details />
                   <VTextField v-model.number="draft.cleanup_interval_minutes" type="number" min="1" label="自动删种间隔（分钟）" hide-details />

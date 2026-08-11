@@ -42,6 +42,35 @@ def test_same_episode_hdr_and_sdr_share_identity_and_hdr_wins():
     assert core.choose_highest([sdr, hdr]) == [hdr]
 
 
+def test_chinese_episode_range_distinguishes_season_titles_without_sxxexx():
+    episode_5_6_hdr = (
+        "Forging Justice S01 2026 2160p WEB-DL H.265 HDR DDP5.1 2Audios-HHWEB "
+        "[重器 | 第05-06集 | 4K HDR]"
+    )
+    episode_5_6_sdr = (
+        "Forging Justice S01 2026 2160p WEB-DL H.265 DDP5.1 2Audios-HHWEB "
+        "[重器 | 第05-06集 | 4K]"
+    )
+    episode_7 = "Forging Justice S01 2026 2160p WEB-DL H.265 [重器 | 第07集 | 4K]"
+
+    assert core.media_key(episode_5_6_hdr) == core.media_key(episode_5_6_sdr)
+    assert core.media_key(episode_5_6_hdr) != core.media_key(episode_7)
+
+
+def test_same_quality_prefers_larger_torrent_after_quality_comparison():
+    title = "Shrouding the Heavens S01E175 2023 2160p WEB-DL H265 DDP2.0-ADWeb"
+    smaller = core.normalize_item({"title": title, "enclosure": "https://x/small", "size": 1 * 1024**3})
+    larger = core.normalize_item({"title": title, "enclosure": "https://x/large", "size": 4 * 1024**3})
+    lower_resolution = core.normalize_item({
+        "title": title.replace("2160p", "1080p"),
+        "enclosure": "https://x/1080",
+        "size": 20 * 1024**3,
+    })
+
+    assert core.choose_highest([smaller, lower_resolution, larger]) == [larger]
+    assert core.dedup_allows(larger, {larger["media_key"]: smaller}) is True
+
+
 def test_promotion_recognizes_structured_and_text_markers():
     assert core.promotion_of({"downloadvolumefactor": 0, "uploadvolumefactor": 1}) == "free"
     assert core.promotion_of({"title": "[2X FREE] Example"}) == "2xfree"

@@ -304,7 +304,7 @@ def test_audiences_detail_lookup_reuses_moviepilot_cookie(plugin_module, monkeyp
     assert captured["url"] == "https://audiences.me/details.php?id=704450&hit=1"
 
 
-def test_flush_keeps_highest_resolution_separately_for_each_site(plugin_module):
+def test_flush_keeps_one_highest_resolution_across_all_sites(plugin_module):
     plugin = plugin_module.BrushFlowTracker()
     plugin.init_plugin({})
     downloader = FakeDownloader()
@@ -328,12 +328,9 @@ def test_flush_keeps_highest_resolution_separately_for_each_site(plugin_module):
     ]
     result = plugin._flush_pending_candidates(service)
 
-    assert result["added"] == 2
-    assert result["site_dedup"] == 1
-    assert len(downloader.added) == 2
-    assert {row["content"] for row in downloader.added} == {
-        "https://a.example/2160", "https://b.example/2160"
-    }
+    assert result["added"] == 1
+    assert result["site_dedup"] == 2
+    assert [row["content"] for row in downloader.added] == ["https://b.example/2160"]
 
 
 def test_flush_keeps_hdr_when_same_site_episode_has_two_4k_releases(plugin_module):
@@ -364,6 +361,86 @@ def test_flush_keeps_hdr_when_same_site_episode_has_two_4k_releases(plugin_modul
     assert result["added"] == 1
     assert result["site_dedup"] == 1
     assert [row["content"] for row in downloader.added] == ["https://a.example/hdr"]
+
+
+def test_adding_upgrade_removes_inferior_managed_task_and_files(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    low = plugin_module.normalize_item({
+        "title": "Shrouding the Heavens S01E175 2023 1080p WEB-DL H265",
+        "enclosure": "https://a.example/1080",
+        "size": 1 * 1024**3,
+    }, now)
+    high = plugin_module.normalize_item({
+        "title": "Shrouding the Heavens S01E175 2023 2160p WEB-DL H265",
+        "enclosure": "https://a.example/2160",
+        "size": 4 * 1024**3,
+    }, now)
+    plugin._state["managed"]["low"] = {
+        "site_id": "other-site", "title": low["title"], "size": low["size"], "added_at": now.isoformat()
+    }
+
+    class ReplacementDownloader:
+        def __init__(self):
+            self.deleted = []
+
+        def add_torrent(self, **_kwargs):
+            return True, ["HIGH"]
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    downloader = ReplacementDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+    result = plugin._add_item(
+        {"id": "a", "name": "Site A"},
+        {"id": "r", "name": "Task A"},
+        high,
+        service,
+    )
+
+    assert result is True
+    assert downloader.deleted == [(["low"], True)]
+    assert "low" not in plugin._state["managed"]
+    assert "high" in plugin._state["managed"]
+
+
+def test_existing_duplicates_keep_best_quality_then_largest_size(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    base = "Forging Justice S01 2026 2160p WEB-DL H.265 DDP5.1 [重器 | 第05-06集]"
+    torrents = [
+        {"hash": "sdr", "name": base, "size": 10 * 1024**3, "progress": 0.8},
+        {"hash": "hdr-small", "name": f"{base} HDR", "size": 3 * 1024**3, "progress": 0.9},
+        {"hash": "hdr-large", "name": f"{base} HDR", "size": 6 * 1024**3, "progress": 0.5},
+    ]
+    for index, torrent in enumerate(torrents):
+        plugin._state["managed"][torrent["hash"]] = {
+            "site_id": "a" if index < 2 else "b",
+            "site_name": "Site A" if index < 2 else "Site B",
+            "title": torrent["name"],
+        }
+
+    class ExistingDownloader:
+        def __init__(self):
+            self.deleted = []
+
+        def get_torrents(self):
+            return torrents, False
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.extend(ids)
+            assert delete_file is True
+            return True
+
+    downloader = ExistingDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+
+    assert plugin._deduplicate_managed_torrents(service, "a") == 2
+    assert set(downloader.deleted) == {"sdr", "hdr-small"}
+    assert set(plugin._state["managed"]) == {"hdr-large"}
 
 
 def test_task_label_recovers_managed_torrent_when_qb_name_differs(plugin_module, monkeypatch):

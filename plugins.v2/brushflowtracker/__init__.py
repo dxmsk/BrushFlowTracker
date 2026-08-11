@@ -28,7 +28,7 @@ from .core import (
     choose_highest,
     dedup_allows,
     first_cleanup_rule,
-    item_quality_rank,
+    item_preference,
     isoformat,
     match_rule,
     normalize_item,
@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.9"
+    plugin_version = "1.1.11"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -294,6 +294,8 @@ class BrushFlowTracker(_PluginBase):
             service, error = self._qb_service()
             if error:
                 raise RuntimeError(error)
+            if self._highest_resolution_dedup:
+                summary["replaced"] += self._deduplicate_managed_torrents(service, site_id)
             self._pending_candidates = []
             target_sites = self._target_sites(site_id)
             site_results: Dict[str, Counter] = {}
@@ -487,6 +489,7 @@ class BrushFlowTracker(_PluginBase):
                                 "resolution": item["resolution"],
                                 "resolution_rank": item["resolution_rank"],
                                 "quality_rank": item["quality_rank"],
+                                "size": item.get("size") or 0,
                                 "updated_at": isoformat(now),
                             }
                     else:
@@ -535,24 +538,111 @@ class BrushFlowTracker(_PluginBase):
                 "resolution": item["resolution"],
                 "resolution_rank": item["resolution_rank"],
                 "quality_rank": item["quality_rank"],
+                "size": managed.get("size") or item.get("size") or 0,
                 "updated_at": managed.get("added_at") or isoformat(datetime.now().astimezone()),
             }
             existing = self._state["dedup_records"].get(key)
-            if existing is None or item_quality_rank(candidate) > item_quality_rank(existing):
+            if existing is None or item_preference(candidate) > item_preference(existing):
                 self._state["dedup_records"][key] = candidate
                 changed = True
         return changed
 
     @staticmethod
-    def _site_media_key(site_id: str, item: Dict[str, Any]) -> str:
-        return f"{site_id}:{item.get('media_key') or item.get('enclosure') or ''}"
+    def _site_media_key(_site_id: str, item: Dict[str, Any]) -> str:
+        # Kept as a compatibility helper name; site_id no longer scopes deduplication.
+        return str(item.get("media_key") or item.get("enclosure") or "")
 
     def _site_dedup_allows(self, site_id: str, item: Dict[str, Any]) -> bool:
         scoped_item = {**item, "media_key": self._site_media_key(site_id, item)}
         return dedup_allows(scoped_item, self._state["dedup_records"])
 
+    def _managed_item(self, record: Dict[str, Any], torrent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        torrent = torrent or {}
+        title = str(torrent.get("name") or record.get("title") or "").strip()
+        size = int(torrent.get("size") or torrent.get("total_size") or record.get("size") or 0)
+        return normalize_item({"title": title, "size": size})
+
+    def _inferior_managed_hashes(self, _site_id: str, item: Dict[str, Any]) -> List[str]:
+        """Find strictly worse managed tasks across every configured site."""
+        candidate_key = str(item.get("media_key") or "")
+        inferior = []
+        for torrent_hash, record in self._state.get("managed", {}).items():
+            current = self._managed_item(record)
+            if current["media_key"] != candidate_key:
+                continue
+            if item_preference(item) > item_preference(current):
+                inferior.append(str(torrent_hash).lower())
+        return inferior
+
+    def _deduplicate_managed_torrents(self, service: Any, _site_id: Optional[str] = None) -> int:
+        """Keep one best managed qB task globally for each media identity."""
+        if not hasattr(service.instance, "get_torrents"):
+            return 0
+        torrents, failed = service.instance.get_torrents()
+        if failed:
+            logger.warning("刷流追新读取 qBittorrent 任务失败，本轮跳过存量任务去重")
+            return 0
+        self._reconcile_pending_managed(service, torrents)
+        self._recover_managed_by_tags(torrents)
+        torrent_map = {
+            str(torrent.get("hash") or "").lower(): torrent
+            for torrent in torrents or []
+            if torrent.get("hash")
+        }
+        groups: Dict[str, List[Tuple[str, Dict[str, Any], Dict[str, Any]]]] = {}
+        for torrent_hash, record in list(self._state.get("managed", {}).items()):
+            torrent = torrent_map.get(str(torrent_hash).lower())
+            if not torrent:
+                continue
+            item = self._managed_item(record, torrent)
+            record.update({
+                "title": item["title"],
+                "resolution": item["resolution"],
+                "resolution_rank": item["resolution_rank"],
+                "quality_rank": item["quality_rank"],
+                "media_key": item["media_key"],
+                "size": item["size"],
+            })
+            key = self._site_media_key(str(record.get("site_id") or ""), item)
+            groups.setdefault(key, []).append((str(torrent_hash).lower(), record, torrent))
+
+        deleted = 0
+        for key, rows in groups.items():
+            winner = max(
+                rows,
+                key=lambda row: (
+                    item_preference(self._managed_item(row[1], row[2])),
+                    float(row[2].get("progress") or 0),
+                    int(row[2].get("added_on") or 0),
+                ),
+            )
+            winner_item = self._managed_item(winner[1], winner[2])
+            self._state["dedup_records"][key] = {
+                "title": winner_item["title"],
+                "resolution": winner_item["resolution"],
+                "resolution_rank": winner_item["resolution_rank"],
+                "quality_rank": winner_item["quality_rank"],
+                "size": winner_item["size"],
+                "updated_at": isoformat(datetime.now().astimezone()),
+            }
+            for torrent_hash, record, torrent in rows:
+                if torrent_hash == winner[0]:
+                    continue
+                if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
+                    deleted += 1
+                    self._archive_managed(
+                        torrent_hash,
+                        f"同一资源已保留更高画质或更大体积版本：{winner_item['title']}",
+                        torrent=torrent,
+                        site_id=record.get("site_id"),
+                    )
+                    logger.info(f"刷流追新去重删除较差版本：{record.get('title')} | 保留={winner_item['title']}")
+                else:
+                    logger.warning(f"刷流追新去重删除 qBittorrent 任务失败：{record.get('title')}")
+        return deleted
+
     def _flush_pending_candidates(self, service: Any) -> Counter:
-        """按站点汇总候选，每个站点的同一影视只添加最高画质条目。"""
+        """汇总所有站点候选，每个资源全局只添加一个最佳版本。"""
         result = Counter()
         pending = list(getattr(self, "_pending_candidates", []) or [])
         self._pending_candidates = []
@@ -565,23 +655,23 @@ class BrushFlowTracker(_PluginBase):
             item = record["item"]
             key = self._site_media_key(record["site"]["id"], item)
             previous = selected.get(key)
-            if previous is None or item_quality_rank(item) > item_quality_rank(previous["item"]):
+            if previous is None or item_preference(item) > item_preference(previous["item"]):
                 if previous is not None:
                     result["site_dedup"] += 1
                     previous.get("site_result", Counter())["site_dedup"] += 1
-                    self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "同站点同一影视已保留更高分辨率版本")
+                    self._log_selection(previous["site"], previous["rule"], previous["item"], "排除", "所有站点同一资源已保留更高画质或更大体积版本")
                 selected[key] = record
             else:
                 result["site_dedup"] += 1
                 record.get("site_result", Counter())["site_dedup"] += 1
-                self._log_selection(record["site"], record["rule"], item, "排除", "同站点同一影视已保留更高或同等分辨率版本")
+                self._log_selection(record["site"], record["rule"], item, "排除", "所有站点同一资源已保留更高画质或更大体积版本")
 
         for record in selected.values():
             site, rule, item = record["site"], record["rule"], record["item"]
             if self._add_item(site, rule, item, service):
                 result["added"] += 1
                 record.get("site_result", Counter())["added"] += 1
-                self._log_selection(site, rule, item, "添加", "符合全部条件且为当前站点最高画质")
+                self._log_selection(site, rule, item, "添加", "符合全部条件且为所有站点全局最佳版本")
                 self._state["processed_urls"][record["url_key"]] = isoformat(record["now"])
                 if self._highest_resolution_dedup:
                     self._state["dedup_records"][self._site_media_key(site["id"], item)] = {
@@ -589,6 +679,7 @@ class BrushFlowTracker(_PluginBase):
                         "resolution": item["resolution"],
                         "resolution_rank": item["resolution_rank"],
                         "quality_rank": item["quality_rank"],
+                        "size": item.get("size") or 0,
                         "updated_at": isoformat(record["now"]),
                     }
             else:
@@ -747,6 +838,11 @@ class BrushFlowTracker(_PluginBase):
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
         task_name = str(rule.get("name") or "RSS 任务").strip()
         tags = [task_name]
+        inferior_hashes = (
+            self._inferior_managed_hashes(site["id"], item)
+            if self._highest_resolution_dedup
+            else []
+        )
         success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
             return False
@@ -766,6 +862,7 @@ class BrushFlowTracker(_PluginBase):
             "resolution_rank": item.get("resolution_rank", identity["resolution_rank"]),
             "quality_rank": item.get("quality_rank", identity["quality_rank"]),
             "media_key": item.get("media_key", identity["media_key"]),
+            "size": item.get("size") or 0,
             "promotion": item["promotion"],
             "free_until": isoformat(item.get("free_until")),
             "tags": tags,
@@ -776,6 +873,21 @@ class BrushFlowTracker(_PluginBase):
         if not hashes:
             self._state["pending_managed"].append(dict(record))
         self._append_history({**record, "event": "added", "torrent_hashes": hashes})
+        replace_hashes = [torrent_hash for torrent_hash in inferior_hashes if torrent_hash not in set(hashes)]
+        if replace_hashes and hashes:
+            if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
+                for torrent_hash in replace_hashes:
+                    old = self._state["managed"].get(torrent_hash, {})
+                    self._archive_managed(
+                        torrent_hash,
+                        f"同一资源已替换为更高画质或更大体积版本：{item['title']}",
+                        site_id=site["id"],
+                    )
+                    logger.info(f"刷流追新替换较差版本：{old.get('title')} | 新版本={item['title']}")
+            else:
+                logger.warning(f"刷流追新已添加优质版本，但删除旧版本失败：{item['title']}")
+        elif replace_hashes:
+            logger.warning(f"刷流追新已添加优质版本但尚未确认新任务 hash，暂不删除旧版本：{item['title']}")
         if item["promotion"] != "normal" and not item.get("free_until"):
             logger.warning(f"刷流追新已添加免费种但无法识别截止时间：{item['title']}")
         logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
@@ -791,12 +903,15 @@ class BrushFlowTracker(_PluginBase):
     ) -> None:
         """记录每个 RSS 条目的最终筛选结果、名称和下载链接。"""
         clean = lambda value: str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+        size = int(item.get("size") or 0)
+        size_text = f"{size / 1024 ** 3:.2f} GiB" if size else "未知"
         logger.info(
             "刷流追新选种 | "
             f"站点={clean(site.get('name'))} | "
             f"任务={clean(rule.get('name'))} | "
             f"结果={clean(outcome)} | "
             f"原因={clean(reason)} | "
+            f"体积={size_text} | "
             f"名称={clean(item.get('title'))} | "
             f"链接={clean(item.get('enclosure'))}"
         )
