@@ -71,6 +71,28 @@ def test_same_quality_prefers_larger_torrent_after_quality_comparison():
     assert core.dedup_allows(larger, {larger["media_key"]: smaller}) is True
 
 
+def test_screenshot_title_variants_share_global_episode_identity():
+    shrouding_titles = [
+        "Shrouding the Heaven 2023 S01 E175 2160p WEB-DL H265 AAC 2.0-PTerWEB",
+        "Shrouding the Heavens S01E175 2023 2160p WEB-DL H265 DDP2.0-ADWeb",
+        "Shrouding.the.Heavens.S01E175.2023.2160p.WEB-DL.H265.AAC-CMCTV",
+    ]
+    silent_titles = [
+        "The Silent Frontline 2026 S01 E15-E16 1080p IQ WEB-DL H264 AAC-PTerWEB",
+        "The.Silent.Frontline.S01E15-E16.2026.2160p.IQ.WEB-DL.H265.AAC-CMCTV",
+    ]
+    forging_titles = [
+        "Forging Justice 2026 S01 E05-E06 1080p WEB-DL H264 AAC-PTerWEB",
+        "Forging Justice S01 2026 2160p WEB-DL H265 DDP5.1 [重器 第05-06集]",
+    ]
+    forging_batch = "Forging.Justice.S01E01-E06.2026.1080p.IQ.WEB-DL.H264.AAC-CMCTV"
+
+    assert len({core.media_key(title) for title in shrouding_titles}) == 1
+    assert len({core.media_key(title) for title in silent_titles}) == 1
+    assert len({core.media_key(title) for title in forging_titles}) == 1
+    assert core.media_key(forging_batch) != core.media_key(forging_titles[0])
+
+
 def test_promotion_recognizes_structured_and_text_markers():
     assert core.promotion_of({"downloadvolumefactor": 0, "uploadvolumefactor": 1}) == "free"
     assert core.promotion_of({"title": "[2X FREE] Example"}) == "2xfree"

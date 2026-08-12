@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-    "version": "1.1.11",
+    "version": "1.1.12",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.12": "增强跨站点剧集身份识别，兼容 S01 E175、S01E175、S01E15-E16、中文第05-06集及英文标题单复数差异",
       "v1.1.11": "去重范围改为所有站点全局统一，同一资源跨站点只保留画质最佳且同画质体积最大的一个托管任务",
       "v1.1.10": "同一站点同资源按画质优先、同画质按种子体积择优；识别第05-06集等中文集数范围，并自动替换插件托管的较差 qB 任务",
       "v1.1.9": "增强同集资源身份归一化，同分辨率按杜比视界、HDR、片源、编码和音轨择优，升级时从托管任务补建去重记录",

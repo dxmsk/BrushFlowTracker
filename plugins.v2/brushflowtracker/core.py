@@ -108,47 +108,61 @@ def detect_resolution(title: str) -> Tuple[str, int]:
     return "OTHER", RESOLUTION_RANK["other"]
 
 
+def _episode_identity(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Extract season and exact episode/range from common PT title formats."""
+    compact = re.search(
+        r"(?<![A-Z0-9])S\s*0*(\d{1,3})\s*E\s*0*(\d{1,4})"
+        r"(?:\s*[-~至到]\s*(?:E\s*)?0*(\d{1,4}))?(?!\d)",
+        text,
+    )
+    if compact:
+        season, start, end = compact.groups()
+        return int(season), int(start), int(end or start)
+
+    season_match = re.search(r"(?<![A-Z0-9])S\s*0*(\d{1,3})(?!\d)", text)
+    chinese = re.search(
+        r"第\s*0*(\d{1,4})\s*(?:[-~至到]\s*0*(\d{1,4}))?\s*[集话話期]",
+        text,
+    )
+    if chinese:
+        start, end = chinese.groups()
+        return int(season_match.group(1)) if season_match else 1, int(start), int(end or start)
+    return (int(season_match.group(1)), None, None) if season_match else (None, None, None)
+
+
+def _canonical_series_title(text: str) -> str:
+    """Extract and normalize the release's series name before technical metadata."""
+    markers = []
+    for pattern in (
+        r"(?<!\d)20\d{2}(?!\d)",
+        r"(?<![A-Z0-9])S\s*\d{1,3}(?!\d)",
+        r"(?<!\d)(?:8K|4K|UHD|4320P|2160[PI]|1080[PI]|720P|576P|480P)(?!\d)",
+    ):
+        match = re.search(pattern, text)
+        if match and match.start() > 0:
+            markers.append(match.start())
+    title = text[:min(markers)] if markers else text
+    words = re.findall(r"[A-Z0-9]+", title)
+    normalized = []
+    for word in words:
+        # PT sites occasionally use singular/plural variants for the same English title.
+        if len(word) > 4 and word.endswith("S") and not word.endswith("SS"):
+            word = word[:-1]
+        normalized.append(word)
+    return " ".join(normalized)
+
+
 def media_key(title: str) -> str:
     """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
     text = unicodedata.normalize("NFKC", title or "").upper()
-    full_text = text
-    episode = re.search(
-        r"(?<![A-Z0-9])S\d{1,3}E\d{1,4}(?:\s*[-~]?\s*E\d{1,4})*(?!\d)",
-        text,
-    )
-    if episode:
-        text = text[:episode.end()]
-    else:
-        resolution = re.search(
-            r"(?<!\d)(?:8K|4K|UHD|4320P|2160[PI]|1080[PI]|720P|576P|480P)(?!\d)",
-            text,
-        )
-        if resolution and resolution.start() > 2:
-            text = text[:resolution.start()]
-        chinese_episode = re.search(
-            r"第\s*0*(\d{1,4})\s*(?:[-~至到]\s*0*(\d{1,4}))?\s*[集话話期]",
-            full_text,
-        )
-        if chinese_episode:
-            start, end = chinese_episode.groups()
-            text = f"{text} EPISODE {int(start)}"
-            if end:
-                text = f"{text} TO {int(end)}"
-    text = re.sub(
-        r"\b(?:8K|4K|UHD|2160[PI]|1080[PI]|720P|576P|480P|"
-        r"BLU-?RAY|REMUX|WEB-?DL|WEBRIP|HDTV|BDRIP|DVDRIP|"
-        r"X26[45]|H26[45]|HEVC|AVC|HDR10\+?|HDR|DV|DOLBY\s*VISION|"
-        r"AAC|DTS(?:-HD)?|TRUEHD|ATMOS)\b",
-        " ",
-        text,
-    )
-    text = re.sub(r"\b(?:PROPER|REPACK|EXTENDED|UNCUT|MULTI|CHS|CHT)\b", " ", text)
-    # Collapse every punctuation/separator variant, including RSS metadata pipes.
-    text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        text = title.strip().upper()
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:24]
+    series = _canonical_series_title(text)
+    season, episode_start, episode_end = _episode_identity(text)
+    identity = [series or re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip()]
+    if season is not None:
+        identity.append(f"S{season}")
+    if episode_start is not None:
+        identity.append(f"E{episode_start}-{episode_end}")
+    return hashlib.sha1("|".join(identity).encode("utf-8")).hexdigest()[:24]
 
 
 def quality_rank(title: str, resolution_rank: Optional[int] = None) -> int:
