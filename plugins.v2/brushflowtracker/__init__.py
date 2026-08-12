@@ -25,10 +25,9 @@ from app.plugins import _PluginBase
 from app.scheduler import Scheduler
 
 from .core import (
-    choose_highest,
-    dedup_allows,
     first_cleanup_rule,
     item_preference,
+    item_preference_with_availability,
     isoformat,
     match_rule,
     normalize_item,
@@ -65,6 +64,7 @@ class _CustomQBAdapter:
                 for key in (
                     "hash", "name", "size", "total_size", "progress", "state", "ratio",
                     "seeding_time", "dlspeed", "upspeed", "added_on", "amount_left", "tags",
+                    "num_seeds", "num_complete", "num_incomplete", "num_leechs",
                 ):
                     data[key] = self._value(row, key)
                 result.append(data)
@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.12"
+    plugin_version = "1.1.15"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -122,6 +122,10 @@ class BrushFlowTracker(_PluginBase):
         self._downloader = normalized["downloader"]
         self._downloader_mode = normalized.get("downloader_mode", "moviepilot")
         self._highest_resolution_dedup = normalized["highest_resolution_dedup"]
+        self._avoid_dead_seeds = normalized["avoid_dead_seeds"]
+        self._dead_seed_wait_minutes = normalized["dead_seed_wait_minutes"]
+        self._dead_seed_min_seeders = normalized["dead_seed_min_seeders"]
+        self._dead_seed_delete_files = normalized["dead_seed_delete_files"]
         self._rss_interval_minutes = normalized["rss_interval_minutes"]
         self._free_monitor_interval_minutes = normalized["free_monitor_interval_minutes"]
         self._cleanup_interval_minutes = normalized["cleanup_interval_minutes"]
@@ -142,6 +146,9 @@ class BrushFlowTracker(_PluginBase):
             "history": list(state.get("history") or []),
             "site_stats": dict(state.get("site_stats") or {}),
             "last_runs": dict(state.get("last_runs") or {}),
+            "dead_seed_urls": dict(state.get("dead_seed_urls") or {}),
+            "dead_seed_watch": dict(state.get("dead_seed_watch") or {}),
+            "dead_seed_fallbacks": dict(state.get("dead_seed_fallbacks") or {}),
         }
         if self._highest_resolution_dedup and self._migrate_managed_dedup_records():
             self._save_state()
@@ -333,6 +340,7 @@ class BrushFlowTracker(_PluginBase):
                 raise RuntimeError("读取 qBittorrent 任务失败")
             self._reconcile_pending_managed(service, torrents)
             self._recover_managed_by_tags(torrents)
+            result["dead_seed_deleted"] += self._monitor_dead_seeds(service, torrents, site_id)
             torrent_map = {str(item.get("hash") or "").lower(): item for item in torrents or []}
             now = datetime.now().astimezone()
             for torrent_hash, record in list(self._state["managed"].items()):
@@ -364,6 +372,76 @@ class BrushFlowTracker(_PluginBase):
         finally:
             self._save_state()
             self._free_lock.release()
+
+    def _monitor_dead_seeds(
+        self, service: Any, torrents: List[Dict[str, Any]], site_id: Optional[str] = None
+    ) -> int:
+        """Delete managed torrents that have no seeders and no progress for too long."""
+        if not self._avoid_dead_seeds or not hasattr(service.instance, "delete_torrents"):
+            return 0
+        now = datetime.now().astimezone()
+        watch = self._state.setdefault("dead_seed_watch", {})
+        deleted = 0
+        active_hashes = set()
+        for torrent in torrents or []:
+            torrent_hash = str(torrent.get("hash") or "").lower()
+            record = self._state["managed"].get(torrent_hash)
+            if not torrent_hash or not record or (site_id and record.get("site_id") != site_id):
+                continue
+            active_hashes.add(torrent_hash)
+            progress = float(torrent.get("progress") or 0)
+            speed = int(torrent.get("dlspeed") or 0)
+            if progress >= 1 or int(torrent.get("amount_left") or 0) <= 0:
+                watch.pop(torrent_hash, None)
+                continue
+            raw_seeds = torrent.get("num_seeds")
+            if raw_seeds is None:
+                raw_seeds = torrent.get("num_complete")
+            if raw_seeds is None:
+                watch.pop(torrent_hash, None)
+                continue
+            try:
+                seeds = int(raw_seeds)
+            except (TypeError, ValueError):
+                watch.pop(torrent_hash, None)
+                continue
+            if seeds >= self._dead_seed_min_seeders or speed > 0:
+                watch.pop(torrent_hash, None)
+                continue
+            entry = watch.setdefault(
+                torrent_hash,
+                {"since": isoformat(now), "progress": progress, "title": record.get("title")},
+            )
+            since = parse_datetime(entry.get("since"), now) or now
+            if (now - since).total_seconds() < self._dead_seed_wait_minutes * 60:
+                continue
+            if not service.instance.delete_torrents(
+                ids=[torrent_hash], delete_file=self._dead_seed_delete_files
+            ):
+                logger.warning(f"刷流追新死种删除失败：{record.get('title')}")
+                continue
+            deleted += 1
+            url = str(record.get("link") or "").strip()
+            if url:
+                self._state.setdefault("dead_seed_urls", {})[
+                    hashlib.sha1(url.encode("utf-8")).hexdigest()
+                ] = isoformat(now)
+            key = self._site_media_key(
+                str(record.get("site_id") or ""),
+                self._managed_item(record, torrent),
+            )
+            current = self._state["dedup_records"].get(key)
+            if current and current.get("title") == record.get("title"):
+                self._state["dedup_records"].pop(key, None)
+            watch.pop(torrent_hash, None)
+            self._archive_managed(torrent_hash, "持续无做种且无下载速度，判定死种后删除", site_id=record.get("site_id"))
+            logger.warning(f"刷流追新删除死种：{record.get('title')} | 等待={self._dead_seed_wait_minutes}分钟")
+            if self._activate_dead_seed_fallback(service, record):
+                logger.info(f"刷流追新已切换死种备用版本：{record.get('title')}")
+        for torrent_hash in list(watch):
+            if torrent_hash not in active_hashes:
+                watch.pop(torrent_hash, None)
+        return deleted
 
     def run_cleanup(self, site_id: Optional[str] = None) -> Dict[str, Any]:
         """按站点配置顺序应用首条命中的自动删种规则。"""
@@ -432,6 +510,11 @@ class BrushFlowTracker(_PluginBase):
                 candidates = []
                 for raw in raw_items or []:
                     item = normalize_item(raw, now)
+                    url_key = hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
+                    if url_key in self._state.get("dead_seed_urls", {}):
+                        result["dead_seed_skipped"] += 1
+                        self._log_selection(site, rule, item, "排除", "该下载链接此前判定为死种")
+                        continue
                     promotion_filter = rule.get("promotion")
                     if promotion_filter in {"free", "free_or_2xfree", "2xfree"}:
                         pre_matched, pre_reason = match_rule(item, {**rule, "promotion": "any"}, now)
@@ -455,12 +538,12 @@ class BrushFlowTracker(_PluginBase):
                     candidates.append(item)
                 result["matched"] += len(candidates)
                 if self._highest_resolution_dedup:
-                    highest_candidates = choose_highest(candidates)
+                    highest_candidates = self._choose_best(candidates)
                     selected_urls = {item["enclosure"] for item in highest_candidates}
                     for item in candidates:
                         if item["enclosure"] not in selected_urls:
                             result["lower_resolution"] += 1
-                            self._log_selection(site, rule, item, "排除", "同批已有同影视的更高或同等优先版本")
+                            self._log_selection(site, rule, item, "排除", "同批已有更可下载或更高画质版本")
                     candidates = highest_candidates
                 for item in candidates:
                     url_key = hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
@@ -470,6 +553,10 @@ class BrushFlowTracker(_PluginBase):
                         continue
                     if self._highest_resolution_dedup:
                         if not self._site_dedup_allows(site["id"], item):
+                            self._save_fallback_candidate(
+                                str(item.get("media_key") or ""),
+                                {"site": site, "rule": rule, "item": item, "url_key": url_key, "now": now},
+                            )
                             result["lower_resolution"] += 1
                             self._log_selection(site, rule, item, "排除", "不高于已下载画质")
                             continue
@@ -542,7 +629,7 @@ class BrushFlowTracker(_PluginBase):
                 "updated_at": managed.get("added_at") or isoformat(datetime.now().astimezone()),
             }
             existing = self._state["dedup_records"].get(key)
-            if existing is None or item_preference(candidate) > item_preference(existing):
+            if existing is None or self._selection_preference(candidate) > self._selection_preference(existing):
                 self._state["dedup_records"][key] = candidate
                 changed = True
         return changed
@@ -553,14 +640,105 @@ class BrushFlowTracker(_PluginBase):
         return str(item.get("media_key") or item.get("enclosure") or "")
 
     def _site_dedup_allows(self, site_id: str, item: Dict[str, Any]) -> bool:
-        scoped_item = {**item, "media_key": self._site_media_key(site_id, item)}
-        return dedup_allows(scoped_item, self._state["dedup_records"])
+        record = self._state["dedup_records"].get(self._site_media_key(site_id, item))
+        return record is None or self._selection_preference(item) > self._selection_preference(record)
+
+    def _selection_preference(self, item: Dict[str, Any]) -> Tuple[int, ...]:
+        if self._avoid_dead_seeds:
+            return item_preference_with_availability(item)
+        return item_preference(item)
+
+    def _choose_best(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        chosen: Dict[str, Dict[str, Any]] = {}
+        order = []
+        for item in items:
+            key = str(item.get("media_key") or item.get("enclosure") or "")
+            if key not in chosen:
+                chosen[key] = item
+                order.append(key)
+            elif self._selection_preference(item) > self._selection_preference(chosen[key]):
+                chosen[key] = item
+        return [chosen[key] for key in order]
+
+    def _remember_dead_seed_fallbacks(self, grouped: Dict[str, List[Dict[str, Any]]], selected: Dict[str, Dict[str, Any]]) -> None:
+        """Persist non-winning candidates so a later dead-seed replacement bypasses RSS age limits."""
+        fallback_state = self._state.setdefault("dead_seed_fallbacks", {})
+        for key, rows in grouped.items():
+            winner = selected.get(key)
+            if not winner:
+                continue
+            for row in rows:
+                if row is not winner:
+                    self._save_fallback_candidate(key, row)
+
+    def _save_fallback_candidate(self, key: str, row: Dict[str, Any]) -> None:
+        """Persist one eligible alternative, capped per media identity."""
+        fallback_state = self._state.setdefault("dead_seed_fallbacks", {})
+        existing_rows = list(fallback_state.get(key) or [])
+        url_key = str(row.get("url_key") or "")
+        if not url_key or any(str(item.get("url_key") or "") == url_key for item in existing_rows):
+            return
+        source_item = row["item"]
+        stored_item = {
+            key: source_item.get(key)
+            for key in (
+                "title", "enclosure", "link", "description", "size", "resolution",
+                "resolution_rank", "quality_rank", "media_key", "series_alias", "promotion",
+                "promotion_known", "seeders",
+            )
+        }
+        stored_item["pubdate"] = isoformat(source_item.get("pubdate"))
+        stored_item["free_until"] = isoformat(source_item.get("free_until"))
+        existing_rows.append({
+            "site": {"id": row["site"].get("id"), "name": row["site"].get("name")},
+            "rule": {"id": row["rule"].get("id"), "name": row["rule"].get("name")},
+            "item": stored_item,
+            "url_key": url_key,
+            "saved_at": isoformat(row.get("now")),
+        })
+        existing_rows.sort(key=lambda item: self._selection_preference(normalize_item(item["item"])), reverse=True)
+        fallback_state[key] = existing_rows[:10]
+
+    def _activate_dead_seed_fallback(self, service: Any, record: Dict[str, Any]) -> bool:
+        """Add the best saved alternative without applying the original RSS age window again."""
+        key = str(record.get("media_key") or "")
+        rows = list(self._state.get("dead_seed_fallbacks", {}).get(key) or [])
+        if not rows:
+            return False
+        dead_urls = set(self._state.get("dead_seed_urls", {}))
+        rows = [row for row in rows if row.get("url_key") not in dead_urls]
+        if not rows:
+            self._state["dead_seed_fallbacks"].pop(key, None)
+            return False
+        for row in rows:
+            row["item"] = normalize_item(row["item"], datetime.now().astimezone())
+        chosen = max(rows, key=lambda row: self._selection_preference(row["item"]))
+        remaining = [row for row in rows if row is not chosen]
+        if remaining:
+            self._state["dead_seed_fallbacks"][key] = remaining
+        else:
+            self._state["dead_seed_fallbacks"].pop(key, None)
+        if not self._add_item(chosen["site"], chosen["rule"], chosen["item"], service):
+            logger.warning(f"刷流追新死种备用版本添加失败：{chosen['item'].get('title')}")
+            return False
+        self._state["processed_urls"][chosen["url_key"]] = isoformat(datetime.now().astimezone())
+        self._state["dedup_records"][key] = {
+            "title": chosen["item"]["title"],
+            "resolution": chosen["item"]["resolution"],
+            "resolution_rank": chosen["item"]["resolution_rank"],
+            "quality_rank": chosen["item"]["quality_rank"],
+            "size": chosen["item"].get("size") or 0,
+            "updated_at": isoformat(datetime.now().astimezone()),
+        }
+        logger.info(f"刷流追新死种切换备用版本：{chosen['item'].get('title')}")
+        return True
 
     def _managed_item(self, record: Dict[str, Any], torrent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         torrent = torrent or {}
         title = str(torrent.get("name") or record.get("title") or "").strip()
+        context = str(record.get("description") or record.get("series_alias") or "")
         size = int(torrent.get("size") or torrent.get("total_size") or record.get("size") or 0)
-        return normalize_item({"title": title, "size": size})
+        return normalize_item({"title": title, "description": context, "size": size})
 
     def _inferior_managed_hashes(self, _site_id: str, item: Dict[str, Any]) -> List[str]:
         """Find strictly worse managed tasks across every configured site."""
@@ -570,7 +748,7 @@ class BrushFlowTracker(_PluginBase):
             current = self._managed_item(record)
             if current["media_key"] != candidate_key:
                 continue
-            if item_preference(item) > item_preference(current):
+            if self._selection_preference(item) > self._selection_preference(current):
                 inferior.append(str(torrent_hash).lower())
         return inferior
 
@@ -611,7 +789,7 @@ class BrushFlowTracker(_PluginBase):
             winner = max(
                 rows,
                 key=lambda row: (
-                    item_preference(self._managed_item(row[1], row[2])),
+                    self._selection_preference(self._managed_item(row[1], row[2])),
                     float(row[2].get("progress") or 0),
                     int(row[2].get("added_on") or 0),
                 ),
@@ -647,6 +825,7 @@ class BrushFlowTracker(_PluginBase):
         pending = list(getattr(self, "_pending_candidates", []) or [])
         self._pending_candidates = []
         selected = {}
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
         if not self._highest_resolution_dedup:
             selected = {f"{index}:{record['item'].get('enclosure') or index}": record for index, record in enumerate(pending)}
         for record in pending:
@@ -654,8 +833,9 @@ class BrushFlowTracker(_PluginBase):
                 break
             item = record["item"]
             key = self._site_media_key(record["site"]["id"], item)
+            grouped.setdefault(key, []).append(record)
             previous = selected.get(key)
-            if previous is None or item_preference(item) > item_preference(previous["item"]):
+            if previous is None or self._selection_preference(item) > self._selection_preference(previous["item"]):
                 if previous is not None:
                     result["site_dedup"] += 1
                     previous.get("site_result", Counter())["site_dedup"] += 1
@@ -666,6 +846,7 @@ class BrushFlowTracker(_PluginBase):
                 record.get("site_result", Counter())["site_dedup"] += 1
                 self._log_selection(record["site"], record["rule"], item, "排除", "所有站点同一资源已保留更高画质或更大体积版本")
 
+        self._remember_dead_seed_fallbacks(grouped, selected)
         for record in selected.values():
             site, rule, item = record["site"], record["rule"], record["item"]
             if self._add_item(site, rule, item, service):
@@ -862,6 +1043,8 @@ class BrushFlowTracker(_PluginBase):
             "resolution_rank": item.get("resolution_rank", identity["resolution_rank"]),
             "quality_rank": item.get("quality_rank", identity["quality_rank"]),
             "media_key": item.get("media_key", identity["media_key"]),
+            "series_alias": item.get("series_alias"),
+            "description": item.get("description") or item.get("summary") or item.get("subtitle") or "",
             "size": item.get("size") or 0,
             "promotion": item["promotion"],
             "free_until": isoformat(item.get("free_until")),
@@ -967,6 +1150,9 @@ class BrushFlowTracker(_PluginBase):
                 "seeding_time": item.get("seeding_time") or 0,
                 "dlspeed": item.get("dlspeed") or 0,
                 "upspeed": item.get("upspeed") or 0,
+                "num_seeds": item.get("num_seeds"),
+                "num_complete": item.get("num_complete"),
+                "num_incomplete": item.get("num_incomplete"),
                 "tags": split_terms(item.get("tags")),
                 "free_until": (self._state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("free_until"),
             }

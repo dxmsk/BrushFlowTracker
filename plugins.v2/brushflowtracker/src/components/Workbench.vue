@@ -406,6 +406,10 @@ onMounted(() => loadStatus())
                     <VBtn class="span-2" variant="tonal" prepend-icon="mdi-connection" :loading="saving" @click="testDownloader">测试自定义 qBittorrent 连接</VBtn>
                   </template>
                   <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="所有站点同一资源只保留最佳画质，同画质保留最大体积" color="primary" hide-details inset />
+                  <VSwitch v-model="draft.avoid_dead_seeds" class="span-2" label="避开无做种死种并自动切换可下载版本" color="warning" hide-details inset />
+                  <VTextField v-model.number="draft.dead_seed_wait_minutes" type="number" min="1" label="死种等待时间" suffix="分钟" hide-details />
+                  <VTextField v-model.number="draft.dead_seed_min_seeders" type="number" min="0" label="最低做种数" suffix="个" hide-details />
+                  <VSwitch v-model="draft.dead_seed_delete_files" label="死种删除文件" color="error" hide-details inset />
                   <VTextField v-model.number="draft.rss_interval_minutes" type="number" min="1" label="RSS 刷新间隔（分钟）" hide-details />
                   <VTextField v-model.number="draft.free_monitor_interval_minutes" type="number" min="1" label="免费期检查间隔（分钟）" hide-details />
                   <VTextField v-model.number="draft.cleanup_interval_minutes" type="number" min="1" label="自动删种间隔（分钟）" hide-details />

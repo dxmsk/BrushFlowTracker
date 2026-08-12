@@ -120,6 +120,10 @@ class SettingsPayload(BaseModel):
     custom_qb_password: str = ""
     custom_qb_save_path: str = ""
     highest_resolution_dedup: bool = True
+    avoid_dead_seeds: bool = True
+    dead_seed_wait_minutes: int = Field(default=30, ge=1, le=10080)
+    dead_seed_min_seeders: int = Field(default=1, ge=0, le=1000)
+    dead_seed_delete_files: bool = True
     rss_interval_minutes: int = Field(default=10, ge=1, le=10080)
     free_monitor_interval_minutes: int = Field(default=2, ge=1, le=1440)
     cleanup_interval_minutes: int = Field(default=30, ge=1, le=10080)

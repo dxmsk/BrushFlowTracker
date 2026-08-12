@@ -93,6 +93,31 @@ def test_screenshot_title_variants_share_global_episode_identity():
     assert core.media_key(forging_batch) != core.media_key(forging_titles[0])
 
 
+def test_cross_language_titles_share_identity_from_chinese_description():
+    night_watcher = core.normalize_item({
+        "title": "[HHC].在下打更人.The.Night.Watcher.S01.2026.2160p.WEB-DL.H.265.HDR.DDP2.0.2Audios-HHWEB",
+        "description": "在下打更人 第01-08集 | 4K HDR",
+        "size": 7.83 * 1024**3,
+    })
+    zai_xia = core.normalize_item({
+        "title": "Zai Xia Da Geng Ren 2026 S01 E01-E08 1080p WEB-DL H264 DDP2.0-PTerWEB",
+        "description": "在下打更人 第1-8集 | 简繁中字",
+        "size": 2.17 * 1024**3,
+    })
+    assert night_watcher["media_key"] == zai_xia["media_key"]
+    assert night_watcher["series_alias"] == zai_xia["series_alias"] == "在下打更人"
+    assert core.choose_highest([zai_xia, night_watcher]) == [night_watcher]
+
+
+def test_seed_availability_beats_quality_when_avoiding_dead_seeds():
+    title = "Example S01E01 2160p WEB-DL"
+    dead = core.normalize_item({"title": title, "seeders": 0, "size": 10 * 1024**3})
+    live = core.normalize_item({"title": title, "seeders": 3, "size": 1 * 1024**3})
+    assert core.item_downloadability(dead) == 0
+    assert core.item_downloadability(live) == 2
+    assert core.choose_highest([dead, live]) == [live]
+
+
 def test_promotion_recognizes_structured_and_text_markers():
     assert core.promotion_of({"downloadvolumefactor": 0, "uploadvolumefactor": 1}) == "free"
     assert core.promotion_of({"title": "[2X FREE] Example"}) == "2xfree"

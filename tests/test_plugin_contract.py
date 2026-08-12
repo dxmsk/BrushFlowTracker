@@ -443,6 +443,97 @@ def test_existing_duplicates_keep_best_quality_then_largest_size(plugin_module):
     assert set(plugin._state["managed"]) == {"hdr-large"}
 
 
+def test_dead_seed_monitor_deletes_stalled_task_and_releases_dedup(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({"dead_seed_wait_minutes": 30, "dead_seed_min_seeders": 1, "dead_seed_delete_files": True})
+    now = datetime.now(timezone.utc)
+    title = "Example S01E01 2160p WEB-DL H265"
+    item = plugin_module.normalize_item({"title": title, "enclosure": "https://a.example/dead"}, now)
+    plugin._state["managed"]["dead"] = {
+        "site_id": "a", "title": title, "link": item["enclosure"], "added_at": now.isoformat()
+    }
+    plugin._state["dedup_records"][item["media_key"]] = {
+        "title": title, "resolution_rank": item["resolution_rank"], "quality_rank": item["quality_rank"]
+    }
+    plugin._state["dead_seed_watch"]["dead"] = {
+        "since": (now - timedelta(minutes=31)).isoformat(), "progress": 0
+    }
+
+    class DeadTasks:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    adapter = DeadTasks()
+    service = type("Service", (), {"instance": adapter})()
+    torrents = [{
+        "hash": "dead", "name": title, "progress": 0.1, "amount_left": 100,
+        "dlspeed": 0, "num_seeds": 0, "num_complete": 0,
+    }]
+    assert plugin._monitor_dead_seeds(service, torrents, "a") == 1
+    assert adapter.deleted == [(["dead"], True)]
+    assert "dead" not in plugin._state["managed"]
+    assert item["media_key"] not in plugin._state["dedup_records"]
+
+
+def test_dead_seed_uses_persisted_fallback_after_publish_window_expires(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({"dead_seed_wait_minutes": 30, "dead_seed_min_seeders": 1})
+    now = datetime.now(timezone.utc)
+    dead = plugin_module.normalize_item({
+        "title": "Example S01E01 2160p WEB-DL H265", "enclosure": "https://a.example/dead"
+    }, now)
+    fallback = plugin_module.normalize_item({
+        "title": "Example S01E01 1080p WEB-DL H264", "enclosure": "https://b.example/live",
+        "pubdate": now - timedelta(hours=2), "seeders": 5,
+    }, now)
+    plugin._state["managed"]["dead"] = {
+        "site_id": "a", "title": dead["title"], "link": dead["enclosure"],
+        "media_key": dead["media_key"], "added_at": now.isoformat(),
+    }
+    plugin._state["dedup_records"][dead["media_key"]] = {
+        "title": dead["title"], "resolution_rank": dead["resolution_rank"],
+        "quality_rank": dead["quality_rank"],
+    }
+    plugin._state["dead_seed_watch"]["dead"] = {
+        "since": (now - timedelta(minutes=31)).isoformat(), "progress": 0,
+    }
+    plugin._save_fallback_candidate(dead["media_key"], {
+        "site": {"id": "b", "name": "Site B"},
+        "rule": {"id": "rb", "name": "Task B", "publish_age_to_minutes": 30},
+        "item": fallback,
+        "url_key": "fallback-url-key",
+        "now": now - timedelta(hours=2),
+    })
+
+    class FailoverTasks:
+        def __init__(self):
+            self.added = []
+            self.deleted = []
+
+        def add_torrent(self, **kwargs):
+            self.added.append(kwargs)
+            return True, ["LIVE"]
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    adapter = FailoverTasks()
+    service = type("Service", (), {"instance": adapter})()
+    torrents = [{
+        "hash": "dead", "name": dead["title"], "progress": 0.1, "amount_left": 100,
+        "dlspeed": 0, "num_seeds": 0,
+    }]
+    assert plugin._monitor_dead_seeds(service, torrents) == 1
+    assert [row["content"] for row in adapter.added] == [fallback["enclosure"]]
+    assert "live" in plugin._state["managed"]
+    assert plugin._state["dedup_records"][dead["media_key"]]["title"] == fallback["title"]
+
+
 def test_task_label_recovers_managed_torrent_when_qb_name_differs(plugin_module, monkeypatch):
     plugin = plugin_module.BrushFlowTracker()
     plugin.init_plugin({

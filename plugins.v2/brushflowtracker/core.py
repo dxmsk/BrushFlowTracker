@@ -152,11 +152,32 @@ def _canonical_series_title(text: str) -> str:
     return " ".join(normalized)
 
 
-def media_key(title: str) -> str:
+def _chinese_series_alias(text: str) -> Optional[str]:
+    """Extract a Chinese series name immediately before a Chinese episode marker."""
+    cleaned = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", text or ""))
+    match = re.search(
+        r"([\u4e00-\u9fff][\u4e00-\u9fff0-9· ]{1,30}?)\s*第\s*0*\d{1,4}"
+        r"(?:\s*[-~至到]\s*0*\d{1,4})?\s*[集话話期]",
+        cleaned,
+    )
+    if not match:
+        return None
+    alias = re.sub(r"[\s|丨:：/\\·]+$", "", match.group(1)).strip()
+    return alias if len(alias) >= 2 else None
+
+
+def media_key(title: str, context: str = "") -> str:
     """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
-    text = unicodedata.normalize("NFKC", title or "").upper()
+    raw_text = unicodedata.normalize("NFKC", title or "")
+    context_text = unicodedata.normalize("NFKC", context or "")
+    alias = _chinese_series_alias(context_text) if context_text.strip() else None
+    text = raw_text.upper()
+    combined = f"{raw_text} {context_text}".upper()
     series = _canonical_series_title(text)
-    season, episode_start, episode_end = _episode_identity(text)
+    season, episode_start, episode_end = _episode_identity(combined)
+    if alias:
+        season = season or 1
+        series = alias
     identity = [series or re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip()]
     if season is not None:
         identity.append(f"S{season}")
@@ -228,6 +249,43 @@ def item_preference(item: Dict[str, Any]) -> Tuple[int, int]:
     """Rank by detected quality first, then prefer the larger torrent."""
     size = max(0, int(_number(item.get("size"), 0) or 0))
     return item_quality_rank(item), size
+
+
+def seed_availability(item: Dict[str, Any]) -> Optional[int]:
+    """Read an RSS seed count when the site exposes one; None means unknown."""
+    fields = list(_iter_fields(item))
+    names = {"seeders", "seeds", "seed", "numseeders", "seedercount", "complete"}
+    for key, value in fields:
+        if key not in names:
+            continue
+        try:
+            number = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            continue
+        if number >= 0:
+            return number
+    text = " ".join(str(value or "") for key, value in fields if key in {"title", "description", "summary"})
+    match = re.search(r"(?:SEED(?:ER)?S?|做种|种子)\s*[:：]?\s*(\d+)", text, re.I)
+    return int(match.group(1)) if match else None
+
+
+def item_downloadability(item: Dict[str, Any]) -> int:
+    """2 = has seeders, 1 = unknown, 0 = explicitly zero seeders."""
+    seeders = item.get("seeders")
+    if seeders is None:
+        seeders = seed_availability(item)
+    if seeders is None:
+        return 1
+    try:
+        return 2 if int(seeders) > 0 else 0
+    except (TypeError, ValueError):
+        return 1
+
+
+def item_preference_with_availability(item: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Prefer downloadable releases, then quality, then larger size."""
+    quality, size = item_preference(item)
+    return item_downloadability(item), quality, size
 
 
 def promotion_of(item: Dict[str, Any]) -> str:
@@ -314,11 +372,15 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         "title": title,
         "enclosure": enclosure,
         "size": int(_number(_field_value(fields, {"size", "length", "filesize", "contentlength"}), 0) or 0),
+        "seeders": seed_availability(raw),
         "pubdate": pubdate,
         "resolution": resolution,
         "resolution_rank": rank,
         "quality_rank": quality_rank(title, rank),
-        "media_key": media_key(title),
+        "media_key": media_key(title, str(raw.get("description") or raw.get("subtitle") or raw.get("summary") or "")),
+        "series_alias": _chinese_series_alias(
+            f"{title} {raw.get('description') or raw.get('subtitle') or raw.get('summary') or ''}"
+        ),
         "promotion": promotion,
         "promotion_known": promotion_known(raw) or bool(free_until),
         "free_until": free_until,
@@ -378,7 +440,7 @@ def choose_highest(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if key not in chosen:
             chosen[key] = item
             order.append(key)
-        elif item_preference(item) > item_preference(chosen[key]):
+        elif item_preference_with_availability(item) > item_preference_with_availability(chosen[key]):
             chosen[key] = item
     return [chosen[key] for key in order]
 
@@ -388,7 +450,7 @@ def dedup_allows(item: Dict[str, Any], records: Dict[str, Dict[str, Any]]) -> bo
     record = records.get(str(item.get("media_key") or ""))
     if not record:
         return True
-    return item_preference(item) > item_preference(record)
+    return item_preference_with_availability(item) > item_preference_with_availability(record)
 
 
 def torrent_tags(torrent: Dict[str, Any]) -> List[str]:
