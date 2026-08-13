@@ -39,6 +39,18 @@ const promotionOptions = [
   { title: '免费或双倍上传免费', value: 'free_or_2xfree' },
   { title: '仅双倍上传免费', value: '2xfree' },
 ]
+const timeUnitOptions = [
+  { title: '秒', value: 'seconds' },
+  { title: '分钟', value: 'minutes' },
+  { title: '小时', value: 'hours' },
+  { title: '天', value: 'days' },
+]
+const sizeUnitOptions = [
+  { title: 'KB', value: 'kib' },
+  { title: 'MB', value: 'mib' },
+  { title: 'GB', value: 'gib' },
+  { title: 'TB', value: 'tib' },
+]
 const taskHeaders = [
   { title: '任务', key: 'name', sortable: false },
   { title: '进度', key: 'progress', sortable: false },
@@ -119,9 +131,11 @@ function addRssRule() {
   selectedSite.value.rss_rules.push({
     id: uid(), name: `RSS 任务 ${selectedSite.value.rss_rules.length + 1}`, enabled: true, url: '',
     uid: '', passkey: '', rss_key: '', rss_key_name: 'rsskey', cookie: '', user_agent: '', referer: '', use_proxy: null,
-    required_keywords: [], excluded_keywords: [], resolutions: [], promotion: 'any',
-    publish_age_from_minutes: null, publish_age_to_minutes: null,
-    size_from_gib: null, size_to_gib: null,
+    whitelist_keywords: [], blacklist_keywords: [], resolutions: [], promotion: 'any',
+    publish_age_from_value: null, publish_age_from_unit: 'minutes',
+    publish_age_to_value: null, publish_age_to_unit: 'minutes',
+    size_from_value: null, size_from_unit: 'gib',
+    size_to_value: null, size_to_unit: 'gib',
   })
 }
 
@@ -167,7 +181,7 @@ async function saveSettings() {
   try {
     const payload = clone(draft.value)
     const rangeFields = [
-      'publish_age_from_minutes', 'publish_age_to_minutes', 'size_from_gib', 'size_to_gib',
+      'publish_age_from_value', 'publish_age_to_value', 'size_from_value', 'size_to_value',
     ]
     payload.sites.forEach(site => site.rss_rules.forEach(rule => {
       rangeFields.forEach(key => { if (rule[key] === '') rule[key] = null })
@@ -233,11 +247,24 @@ function formatBytes(value) {
 }
 
 function historyMeta(row) {
-  const parts = row.reason
-    ? [row.reason]
-    : [row.rule_name || 'RSS 任务', row.resolution || '未知画质']
+  const parts = [row.outcome || (row.event === 'added' ? '下载' : row.event === 'deleted' ? '删除' : '处理')]
+  if (row.reason) parts.push(row.reason)
+  else parts.push(row.rule_name || 'RSS 任务', row.resolution || '未知画质')
   if (Number(row.size || 0) > 0) parts.push(formatBytes(row.size))
   return parts.join(' · ')
+}
+
+function historyIcon(row) {
+  if (row.event === 'deleted') return 'mdi-delete-circle-outline'
+  if (row.outcome === '排除') return 'mdi-close-circle-outline'
+  if (row.outcome === '失败') return 'mdi-alert-circle-outline'
+  return 'mdi-download-circle-outline'
+}
+
+function historyColor(row) {
+  if (row.outcome === '排除') return 'error'
+  if (row.event === 'deleted' || row.outcome === '失败') return 'warning'
+  return 'success'
 }
 
 function formatTime(value) {
@@ -345,17 +372,17 @@ onMounted(() => loadStatus())
                         <VTextField :model-value="rule.name" label="任务名称（同时作为标签）" :rules="[value => Boolean(String(value || '').trim()) || '任务名称不能为空', value => !String(value || '').includes(',') || '不能包含英文逗号']" hide-details="auto" @update:model-value="updateTaskName(rule, $event)" />
                         <VSwitch v-model="rule.enabled" label="启用规则" hide-details color="success" inset />
                         <VTextField v-model="rule.url" class="span-2" label="RSS 订阅地址" placeholder="https://tracker.example/torrentrss.php?..." hide-details />
-                        <VCombobox v-model="rule.required_keywords" label="必须包含关键词" multiple chips closable-chips hide-details />
-                        <VCombobox v-model="rule.excluded_keywords" label="排除关键词" multiple chips closable-chips hide-details />
+                        <VCombobox v-model="rule.whitelist_keywords" label="白名单关键词（必须全部包含）" multiple chips closable-chips hide-details />
+                        <VCombobox v-model="rule.blacklist_keywords" label="黑名单关键词（命中任一个即排除）" multiple chips closable-chips hide-details />
                         <VSelect v-model="rule.resolutions" :items="resolutionOptions" label="分辨率筛选" multiple chips closable-chips clearable hide-details />
                         <VSelect v-model="rule.promotion" :items="promotionOptions" label="免费期筛选" hide-details />
                         <div class="range-control">
-                          <span>发种时间范围（分钟）</span>
-                          <div class="range-fields"><VTextField v-model.number="rule.publish_age_from_minutes" type="number" min="0" label="从" suffix="分钟" clearable hide-details /><b>至</b><VTextField v-model.number="rule.publish_age_to_minutes" type="number" min="0" label="到" suffix="分钟" clearable hide-details /></div>
+                          <span>发种时间范围</span>
+                          <div class="range-fields range-fields--units"><div class="value-unit"><VTextField v-model.number="rule.publish_age_from_value" type="number" min="0" label="从" clearable hide-details /><VSelect v-model="rule.publish_age_from_unit" :items="timeUnitOptions" aria-label="起始时间单位" hide-details /></div><b>至</b><div class="value-unit"><VTextField v-model.number="rule.publish_age_to_value" type="number" min="0" label="到" clearable hide-details /><VSelect v-model="rule.publish_age_to_unit" :items="timeUnitOptions" aria-label="结束时间单位" hide-details /></div></div>
                         </div>
                         <div class="range-control">
-                          <span>文件大小范围（GiB）</span>
-                          <div class="range-fields"><VTextField v-model.number="rule.size_from_gib" type="number" min="0" step="0.1" label="从" suffix="GiB" clearable hide-details /><b>至</b><VTextField v-model.number="rule.size_to_gib" type="number" min="0" step="0.1" label="到" suffix="GiB" clearable hide-details /></div>
+                          <span>种子大小范围</span>
+                          <div class="range-fields range-fields--units"><div class="value-unit"><VTextField v-model.number="rule.size_from_value" type="number" min="0" step="0.1" label="从" clearable hide-details /><VSelect v-model="rule.size_from_unit" :items="sizeUnitOptions" aria-label="起始体积单位" hide-details /></div><b>至</b><div class="value-unit"><VTextField v-model.number="rule.size_to_value" type="number" min="0" step="0.1" label="到" clearable hide-details /><VSelect v-model="rule.size_to_unit" :items="sizeUnitOptions" aria-label="结束体积单位" hide-details /></div></div>
                         </div>
                       </div>
                       <div class="rule-actions"><VTooltip text="上移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-up" size="small" variant="text" :disabled="index === 0" @click="moveRule(selectedSite.rss_rules, index, -1)" /></template></VTooltip><VTooltip text="下移"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-arrow-down" size="small" variant="text" :disabled="index === selectedSite.rss_rules.length - 1" @click="moveRule(selectedSite.rss_rules, index, 1)" /></template></VTooltip><VSpacer /><VBtn variant="tonal" color="primary" prepend-icon="mdi-shield-key-outline" @click="openAuthPage(rule)">认证/防403</VBtn><VBtn color="error" variant="text" prepend-icon="mdi-delete-outline" @click="removeRssRule(index)">删除</VBtn></div>
@@ -387,7 +414,7 @@ onMounted(() => loadStatus())
             </VWindowItem>
 
             <VWindowItem value="history">
-              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>最近 100 条添加与删除结果；点击种子名称进入站点详情页</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}`"><VIcon :icon="row.event === 'added' ? 'mdi-download-circle-outline' : 'mdi-delete-circle-outline'" :color="row.event === 'added' ? 'success' : 'warning'" /><div><a v-if="row.link" :href="row.link" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><strong v-else>{{ row.title }}</strong><span>{{ historyMeta(row) }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
+              <VSheet class="panel app-surface-static"><header class="panel__head"><div><h2>处理记录</h2><p>对比每个种子的规则条件与实际检测结果；点击名称进入种子页面</p></div></header><div class="history-list"><article v-for="row in status.history || []" :key="`${row.time}-${row.title}-${row.outcome}`"><VIcon :icon="historyIcon(row)" :color="historyColor(row)" /><div><a v-if="row.link" :href="row.link" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><strong v-else>{{ row.title }}</strong><span class="history-result">{{ historyMeta(row) }}</span><span v-if="row.rule_summary"><b>规则条件：</b>{{ row.rule_summary }}</span><span v-if="row.actual_summary"><b>实际检测：</b>{{ row.actual_summary }}</span></div><time>{{ formatTime(row.time) }}</time></article><div v-if="!status.history?.length" class="empty-table">暂无处理记录</div></div></VSheet>
             </VWindowItem>
 
             <VWindowItem value="settings">
@@ -505,6 +532,7 @@ onMounted(() => loadStatus())
 .range-control > span { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .8rem; }
 .range-fields { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 8px; }
 .range-fields b { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-weight: 400; }
+.value-unit { display: grid; grid-template-columns: minmax(5.5rem, 1fr) minmax(6rem, .8fr); gap: 6px; min-inline-size: 0; }
 .rule-actions { margin-block-start: 12px; }
 .cleanup-list { display: flex; flex-direction: column; gap: 10px; }
 .cleanup-rule { display: grid; grid-template-columns: 32px minmax(0, 1fr) 36px; align-items: center; gap: 12px; padding: 14px; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: var(--app-control-radius); }
@@ -518,9 +546,11 @@ onMounted(() => loadStatus())
 .history-list article a { color: rgb(var(--v-theme-primary)); font-weight: 600; text-decoration: none; }
 .history-list article a:hover { text-decoration: underline; }
 .history-list article span, .history-list time { color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity)); font-size: .8rem; }
+.history-list article span b { color: rgba(var(--v-theme-on-surface), var(--v-high-emphasis-opacity)); font-weight: 600; }
+.history-list article .history-result { color: rgba(var(--v-theme-on-surface), var(--v-high-emphasis-opacity)); }
 .settings-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-block-start: 18px; }
 @media (max-width: 1199px) { .cleanup-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (min-width: 960px) { .tracker--compact { block-size: calc(100dvh - 48px); min-block-size: 0; overflow: hidden; } .tracker--compact .tracker__layout { flex: 1 1 auto; min-block-size: 0; overflow: hidden; } .tracker--compact .site-rail { position: static; block-size: 100%; max-block-size: none; } .tracker--compact .workspace { block-size: 100%; padding-inline-end: 4px; overflow-y: auto; } }
 @media (max-width: 959px) { .tracker { padding: 12px; } .site-rail { display: none; } .mobile-site { display: block; margin-block-end: 12px; } .tracker__layout { grid-template-columns: 1fr; } .rule-grid, .settings-grid { grid-template-columns: 1fr; } .span-2 { grid-column: auto; } }
-@media (max-width: 699px) { .tracker__identity p, .tracker__actions > :deep(.v-btn:first-child) { display: none; } .tracker__actions { flex-wrap: nowrap; } .site-head { align-items: flex-start; flex-direction: column; } .site-head__actions { inline-size: 100%; justify-content: space-between; } .panel__head { flex-direction: column; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .task-table { font-size: .8rem; } .cleanup-rule { grid-template-columns: 28px minmax(0, 1fr); } .vertical-actions { grid-column: 2; flex-direction: row; } .cleanup-fields { grid-template-columns: 1fr; } .history-list article { grid-template-columns: auto minmax(0, 1fr); } .history-list time { grid-column: 2; } }
+@media (max-width: 699px) { .tracker__identity p, .tracker__actions > :deep(.v-btn:first-child) { display: none; } .tracker__actions { flex-wrap: nowrap; } .site-head { align-items: flex-start; flex-direction: column; } .site-head__actions { inline-size: 100%; justify-content: space-between; } .panel__head { flex-direction: column; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .task-table { font-size: .8rem; } .cleanup-rule { grid-template-columns: 28px minmax(0, 1fr); } .vertical-actions { grid-column: 2; flex-direction: row; } .cleanup-fields { grid-template-columns: 1fr; } .range-fields--units { grid-template-columns: 1fr; } .range-fields--units > b { text-align: center; } .value-unit { grid-template-columns: minmax(0, 1fr) minmax(6rem, .65fr); } .history-list article { grid-template-columns: auto minmax(0, 1fr); } .history-list time { grid-column: 2; } }
 </style>

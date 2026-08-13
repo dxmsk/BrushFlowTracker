@@ -21,13 +21,17 @@ class RssRulePayload(BaseModel):
     user_agent: str = ""
     referer: str = ""
     use_proxy: Optional[bool] = None
-    required_keywords: List[str] = Field(default_factory=list)
-    excluded_keywords: List[str] = Field(default_factory=list)
+    whitelist_keywords: List[str] = Field(default_factory=list)
+    blacklist_keywords: List[str] = Field(default_factory=list)
     resolutions: List[str] = Field(default_factory=list)
-    publish_age_from_minutes: Optional[float] = Field(default=None, ge=0)
-    publish_age_to_minutes: Optional[float] = Field(default=None, ge=0)
-    size_from_gib: Optional[float] = Field(default=None, ge=0)
-    size_to_gib: Optional[float] = Field(default=None, ge=0)
+    publish_age_from_value: Optional[float] = Field(default=None, ge=0)
+    publish_age_from_unit: Literal["seconds", "minutes", "hours", "days"] = "minutes"
+    publish_age_to_value: Optional[float] = Field(default=None, ge=0)
+    publish_age_to_unit: Literal["seconds", "minutes", "hours", "days"] = "minutes"
+    size_from_value: Optional[float] = Field(default=None, ge=0)
+    size_from_unit: Literal["kib", "mib", "gib", "tib"] = "gib"
+    size_to_value: Optional[float] = Field(default=None, ge=0)
+    size_to_unit: Literal["kib", "mib", "gib", "tib"] = "gib"
     promotion: Literal["any", "free", "free_or_2xfree", "2xfree"] = "any"
 
     @field_validator("name")
@@ -53,16 +57,20 @@ class RssRulePayload(BaseModel):
     @model_validator(mode="after")
     def validate_ranges(self) -> "RssRulePayload":
         """保证发种时间和文件大小范围的起点不大于终点。"""
+        age_factors = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+        size_factors = {"kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
         if (
-            self.publish_age_from_minutes is not None
-            and self.publish_age_to_minutes is not None
-            and self.publish_age_from_minutes > self.publish_age_to_minutes
+            self.publish_age_from_value is not None
+            and self.publish_age_to_value is not None
+            and self.publish_age_from_value * age_factors[self.publish_age_from_unit]
+            > self.publish_age_to_value * age_factors[self.publish_age_to_unit]
         ):
             raise ValueError("发种时间范围起点不能大于终点")
         if (
-            self.size_from_gib is not None
-            and self.size_to_gib is not None
-            and self.size_from_gib > self.size_to_gib
+            self.size_from_value is not None
+            and self.size_to_value is not None
+            and self.size_from_value * size_factors[self.size_from_unit]
+            > self.size_to_value * size_factors[self.size_to_unit]
         ):
             raise ValueError("文件大小范围起点不能大于终点")
         return self

@@ -392,34 +392,65 @@ def match_rule(item: Dict[str, Any], rule: Dict[str, Any], now: Optional[datetim
     if not item.get("title") or not item.get("enclosure"):
         return False, "条目缺少标题或下载地址"
     haystack = f"{item.get('title', '')}\n{item.get('description', '')}".casefold()
-    required = split_terms(rule.get("required_keywords"))
-    excluded = split_terms(rule.get("excluded_keywords"))
-    if required and not all(term.casefold() in haystack for term in required):
-        return False, "缺少必须关键词"
-    if excluded and any(term.casefold() in haystack for term in excluded):
-        return False, "命中排除关键词"
+    whitelist = split_terms(rule.get("whitelist_keywords") or rule.get("required_keywords"))
+    blacklist = split_terms(rule.get("blacklist_keywords") or rule.get("excluded_keywords"))
+    blacklist_hits = [term for term in blacklist if term.casefold() in haystack]
+    if blacklist_hits:
+        return False, f"命中黑名单关键词：{', '.join(blacklist_hits)}"
+    whitelist_missing = [term for term in whitelist if term.casefold() not in haystack]
+    if whitelist_missing:
+        return False, f"缺少白名单关键词：{', '.join(whitelist_missing)}"
     resolutions = {str(value).upper() for value in rule.get("resolutions") or []}
     if resolutions and item.get("resolution") not in resolutions:
         return False, "分辨率不匹配"
-    size_from = _number(rule.get("size_from_gib"), None)
-    size_to = _number(rule.get("size_to_gib"), None)
+    size_factors = {"kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+    size_from_value = _number(rule.get("size_from_value"), None)
+    size_to_value = _number(rule.get("size_to_value"), None)
+    size_from = (
+        size_from_value * size_factors.get(str(rule.get("size_from_unit") or "gib").lower(), 1024 ** 3)
+        if size_from_value is not None else None
+    )
+    size_to = (
+        size_to_value * size_factors.get(str(rule.get("size_to_unit") or "gib").lower(), 1024 ** 3)
+        if size_to_value is not None else None
+    )
+    if size_from is None:
+        legacy_size_from = _number(rule.get("size_from_gib"), None)
+        size_from = legacy_size_from * 1024 ** 3 if legacy_size_from is not None else None
+    if size_to is None:
+        legacy_size_to = _number(rule.get("size_to_gib"), None)
+        size_to = legacy_size_to * 1024 ** 3 if legacy_size_to is not None else None
     if size_from is not None or size_to is not None:
         size = int(item.get("size") or 0)
         if size <= 0:
             return False, "缺少文件大小，无法判断范围"
-        size_gib = size / 1024 ** 3
-        if (size_from is not None and size_gib < size_from) or (size_to is not None and size_gib > size_to):
+        if (size_from is not None and size < size_from) or (size_to is not None and size > size_to):
             return False, "文件大小不在范围"
-    age_from = _number(rule.get("publish_age_from_minutes"), None)
-    age_to = _number(rule.get("publish_age_to_minutes"), None)
+    age_factors = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+    age_from_value = _number(rule.get("publish_age_from_value"), None)
+    age_to_value = _number(rule.get("publish_age_to_value"), None)
+    age_from = (
+        age_from_value * age_factors.get(str(rule.get("publish_age_from_unit") or "minutes").lower(), 60)
+        if age_from_value is not None else None
+    )
+    age_to = (
+        age_to_value * age_factors.get(str(rule.get("publish_age_to_unit") or "minutes").lower(), 60)
+        if age_to_value is not None else None
+    )
+    if age_from is None:
+        legacy_age_from = _number(rule.get("publish_age_from_minutes"), None)
+        age_from = legacy_age_from * 60 if legacy_age_from is not None else None
+    if age_to is None:
+        legacy_age_to = _number(rule.get("publish_age_to_minutes"), None)
+        age_to = legacy_age_to * 60 if legacy_age_to is not None else None
     pubdate = item.get("pubdate")
     reference = now or datetime.now().astimezone()
     if age_from is not None or age_to is not None:
         if not pubdate:
             return False, "缺少发种时间，无法判断范围"
-        age_minutes = (reference - pubdate).total_seconds() / 60
+        age_seconds = (reference - pubdate).total_seconds()
         lower_bound = age_from if age_from is not None else 0
-        if age_minutes < lower_bound or (age_to is not None and age_minutes > age_to):
+        if age_seconds < lower_bound or (age_to is not None and age_seconds > age_to):
             return False, "发种时间不在范围"
     promotion_filter = rule.get("promotion", "any")
     if promotion_filter == "free" and item.get("promotion") != "free":

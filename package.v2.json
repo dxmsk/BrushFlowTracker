@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-    "version": "1.1.16",
+    "version": "1.1.17",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.17": "选种规则支持天/小时/分钟/秒与 KB/MB/GB/TB 自定义范围单位；新增白名单和黑名单关键词；处理记录持久化展示下载/排除结果、规则条件与种子实际检测值",
       "v1.1.16": "修复 qB 添加任务未立即返回 hash 时误认同标签旧任务的问题；仅确认添加后新出现的任务，并在确认后延迟删除同资源低画质版本",
       "v1.1.15": "死种删除后从首次 RSS 时间窗口持久化的备用候选中切换，不受后续发种时间范围过期影响；备用记录不保存站点认证信息",
       "v1.1.14": "新增死种保护：RSS 零做种版本降级，qB 任务持续无速度且无做种超过设定时间后自动删除并切换候选版本",

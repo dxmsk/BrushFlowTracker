@@ -167,10 +167,14 @@ def test_legacy_limits_migrate_to_ranges(plugin_module):
         }
     )
     task = plugin._sites[0]["rss_rules"][0]
-    assert task["publish_age_from_minutes"] == 0
-    assert task["publish_age_to_minutes"] == 30
-    assert task["size_from_gib"] == 5
-    assert task["size_to_gib"] is None
+    assert task["publish_age_from_value"] == 0
+    assert task["publish_age_from_unit"] == "minutes"
+    assert task["publish_age_to_value"] == 30
+    assert task["publish_age_to_unit"] == "minutes"
+    assert task["size_from_value"] == 5
+    assert task["size_from_unit"] == "gib"
+    assert task["size_to_value"] is None
+    assert task["size_to_unit"] == "gib"
     assert "max_age_minutes" not in task
     assert "min_size_gib" not in task
 
@@ -207,17 +211,42 @@ def test_selection_log_contains_task_title_link_and_reason(plugin_module, monkey
     messages = []
     recorder = type("Recorder", (), {"info": lambda _self, message: messages.append(message)})()
     monkeypatch.setattr(plugin_module, "logger", recorder)
-    plugin_module.BrushFlowTracker._log_selection(
-        {"name": "站点 A"},
-        {"name": "4K 追新"},
-        {"title": "Example 2160P", "enclosure": "https://tracker.example/download/2"},
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    plugin._log_selection(
+        {"id": "a", "name": "站点 A"},
+        {"id": "r", "name": "4K 追新", "blacklist_keywords": ["CAM"]},
+        {"title": "Example 2160P CAM", "enclosure": "https://tracker.example/download/2"},
         "排除",
-        "命中排除关键词",
+        "命中黑名单关键词：CAM",
     )
     assert "任务=4K 追新" in messages[0]
-    assert "名称=Example 2160P" in messages[0]
+    assert "名称=Example 2160P CAM" in messages[0]
     assert "链接=https://tracker.example/download/2" in messages[0]
-    assert "原因=命中排除关键词" in messages[0]
+    assert "原因=命中黑名单关键词：CAM" in messages[0]
+    assert plugin._state["history"][0]["event"] == "selection"
+    assert plugin._state["history"][0]["outcome"] == "排除"
+    assert "黑名单(任一排除)=CAM" in plugin._state["history"][0]["rule_summary"]
+    assert "黑名单命中=CAM" in plugin._state["history"][0]["actual_summary"]
+
+
+def test_download_selection_enriches_existing_added_history_without_duplicate(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    plugin._state["history"] = [{
+        "event": "added", "title": "Example 4K", "time": "2026-08-13T10:00:00+08:00",
+    }]
+    plugin._log_selection(
+        {"id": "a", "name": "站点 A"},
+        {"id": "r", "name": "4K 追新", "whitelist_keywords": ["Example"]},
+        {"title": "Example 4K", "enclosure": "https://tracker.example/download/4", "resolution": "4K"},
+        "添加",
+        "符合全部条件",
+    )
+    assert len(plugin._state["history"]) == 1
+    assert plugin._state["history"][0]["event"] == "added"
+    assert plugin._state["history"][0]["outcome"] == "添加"
+    assert "白名单命中=Example" in plugin._state["history"][0]["actual_summary"]
 
 
 def test_audiences_detail_url_can_be_recovered_from_download_link(plugin_module):
@@ -731,5 +760,24 @@ def test_site_name_cannot_be_empty(plugin_module):
 def test_range_start_cannot_exceed_end(plugin_module):
     with pytest.raises(ValueError, match="发种时间范围起点不能大于终点"):
         plugin_module.SettingsPayload(
-            sites=[{"name": "A", "rss_rules": [{"name": "R1", "publish_age_from_minutes": 30, "publish_age_to_minutes": 0}]}]
+            sites=[{"name": "A", "rss_rules": [{
+                "name": "R1",
+                "publish_age_from_value": 2,
+                "publish_age_from_unit": "hours",
+                "publish_age_to_value": 30,
+                "publish_age_to_unit": "minutes",
+            }]}]
+        )
+
+
+def test_size_range_validation_compares_different_units(plugin_module):
+    with pytest.raises(ValueError, match="文件大小范围起点不能大于终点"):
+        plugin_module.SettingsPayload(
+            sites=[{"name": "A", "rss_rules": [{
+                "name": "R1",
+                "size_from_value": 2,
+                "size_from_unit": "gib",
+                "size_to_value": 1500,
+                "size_to_unit": "mib",
+            }]}]
         )

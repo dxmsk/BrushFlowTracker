@@ -151,14 +151,28 @@ def test_free_remaining_time_also_marks_item_free_without_free_title_marker():
     assert item["free_until"] == now + timedelta(hours=23, minutes=26)
 
 
-def test_match_rule_requires_all_required_keywords():
+def test_match_rule_requires_all_whitelist_keywords_and_reports_missing_term():
     now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
     item = core.normalize_item({"title": "Example 4K HDR", "enclosure": "https://x/t", "size": 20 * 1024**3}, now)
-    matched, _ = core.match_rule(item, {"required_keywords": ["example", "HDR"]}, now)
-    rejected, reason = core.match_rule(item, {"required_keywords": ["example", "DV"]}, now)
+    matched, _ = core.match_rule(item, {"whitelist_keywords": ["example", "HDR"]}, now)
+    rejected, reason = core.match_rule(item, {"whitelist_keywords": ["example", "DV"]}, now)
     assert matched is True
     assert rejected is False
-    assert reason == "缺少必须关键词"
+    assert reason == "缺少白名单关键词：DV"
+
+
+def test_match_rule_blacklist_takes_precedence_and_reports_matching_terms():
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    item = core.normalize_item({
+        "title": "Example 4K HDR BAD-GROUP",
+        "enclosure": "https://x/t",
+    }, now)
+    matched, reason = core.match_rule(item, {
+        "whitelist_keywords": ["Example", "HDR"],
+        "blacklist_keywords": ["CAM", "BAD-GROUP"],
+    }, now)
+    assert matched is False
+    assert reason == "命中黑名单关键词：BAD-GROUP"
 
 
 def test_match_rule_applies_exclusions_resolution_age_and_size():
@@ -206,6 +220,29 @@ def test_match_rule_accepts_configured_age_and_size_ranges():
         "size_to_gib": 30,
     }
     assert core.match_rule(item, rule, now) == (True, "命中")
+
+
+def test_match_rule_supports_mixed_time_and_size_units():
+    now = datetime(2026, 8, 9, 8, 0, tzinfo=timezone.utc)
+    item = core.normalize_item({
+        "title": "Example 4K",
+        "enclosure": "https://x/t",
+        "size": 1536 * 1024**2,
+        "pubdate": now - timedelta(hours=2),
+    }, now)
+    rule = {
+        "publish_age_from_value": 90,
+        "publish_age_from_unit": "minutes",
+        "publish_age_to_value": 3,
+        "publish_age_to_unit": "hours",
+        "size_from_value": 1000,
+        "size_from_unit": "mib",
+        "size_to_value": 2,
+        "size_to_unit": "gib",
+    }
+    assert core.match_rule(item, rule, now) == (True, "命中")
+    assert core.match_rule(item, {**rule, "publish_age_to_value": 7199, "publish_age_to_unit": "seconds"}, now)[0] is False
+    assert core.match_rule(item, {**rule, "size_to_value": 1500, "size_to_unit": "mib"}, now)[0] is False
 
 
 def test_match_rule_applies_free_filter():

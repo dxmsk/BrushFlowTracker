@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.16"
+    plugin_version = "1.1.17"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -1094,8 +1094,8 @@ class BrushFlowTracker(_PluginBase):
         logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
         return True
 
-    @staticmethod
     def _log_selection(
+        self,
         site: Dict[str, Any],
         rule: Dict[str, Any],
         item: Dict[str, Any],
@@ -1106,6 +1106,7 @@ class BrushFlowTracker(_PluginBase):
         clean = lambda value: str(value or "").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
         size = int(item.get("size") or 0)
         size_text = f"{size / 1024 ** 3:.2f} GiB" if size else "未知"
+        rule_summary, actual_summary = self._selection_comparison(rule, item)
         logger.info(
             "刷流追新选种 | "
             f"站点={clean(site.get('name'))} | "
@@ -1116,6 +1117,90 @@ class BrushFlowTracker(_PluginBase):
             f"名称={clean(item.get('title'))} | "
             f"链接={clean(item.get('enclosure'))}"
         )
+        selection_record = {
+            "site_id": site.get("id"),
+            "site_name": site.get("name"),
+            "rule_id": rule.get("id"),
+            "rule_name": rule.get("name"),
+            "title": item.get("title"),
+            "link": item.get("link") or item.get("enclosure"),
+            "resolution": item.get("resolution"),
+            "size": size,
+            "event": "selection",
+            "outcome": outcome,
+            "reason": reason,
+            "rule_summary": rule_summary,
+            "actual_summary": actual_summary,
+        }
+        if outcome == "添加":
+            for history in reversed(self._state.get("history", [])):
+                if history.get("event") == "added" and history.get("title") == item.get("title"):
+                    history.update(selection_record)
+                    history["event"] = "added"
+                    break
+            else:
+                self._append_history(selection_record)
+        else:
+            self._append_history(selection_record)
+
+    @staticmethod
+    def _selection_comparison(rule: Dict[str, Any], item: Dict[str, Any]) -> Tuple[str, str]:
+        """生成人可读的规则与种子实际值对照，供日志页面解释筛选结果。"""
+        whitelist = split_terms(rule.get("whitelist_keywords") or rule.get("required_keywords"))
+        blacklist = split_terms(rule.get("blacklist_keywords") or rule.get("excluded_keywords"))
+        haystack = f"{item.get('title', '')}\n{item.get('description', '')}".casefold()
+        whitelist_hits = [term for term in whitelist if term.casefold() in haystack]
+        whitelist_missing = [term for term in whitelist if term.casefold() not in haystack]
+        blacklist_hits = [term for term in blacklist if term.casefold() in haystack]
+
+        time_units = {"seconds": "秒", "minutes": "分钟", "hours": "小时", "days": "天"}
+        size_units = {"kib": "KB", "mib": "MB", "gib": "GB", "tib": "TB"}
+
+        def range_text(prefix: str, unit_names: Dict[str, str], default_unit: str) -> str:
+            start = rule.get(f"{prefix}_from_value")
+            end = rule.get(f"{prefix}_to_value")
+            if start is None and end is None:
+                return "不限"
+            start_text = "不限" if start is None else f"{start:g} {unit_names.get(str(rule.get(f'{prefix}_from_unit') or default_unit), default_unit)}"
+            end_text = "不限" if end is None else f"{end:g} {unit_names.get(str(rule.get(f'{prefix}_to_unit') or default_unit), default_unit)}"
+            return f"{start_text} 至 {end_text}"
+
+        promotion_names = {
+            "any": "不限", "free": "仅免费", "free_or_2xfree": "免费或双倍上传免费", "2xfree": "仅双倍上传免费",
+            "normal": "普通", "unknown": "未知",
+        }
+        rule_parts = [
+            f"白名单(全部包含)={', '.join(whitelist) if whitelist else '不限'}",
+            f"黑名单(任一排除)={', '.join(blacklist) if blacklist else '不限'}",
+            f"画质={', '.join(rule.get('resolutions') or []) or '不限'}",
+            f"发种时间={range_text('publish_age', time_units, 'minutes')}",
+            f"体积={range_text('size', size_units, 'gib')}",
+            f"促销={promotion_names.get(str(rule.get('promotion') or 'any'), str(rule.get('promotion') or '不限'))}",
+        ]
+
+        pubdate = item.get("pubdate")
+        age_text = "未知"
+        if pubdate:
+            age_seconds = max(0, (datetime.now().astimezone() - pubdate).total_seconds())
+            if age_seconds < 60:
+                age_text = f"{age_seconds:.0f} 秒"
+            elif age_seconds < 3600:
+                age_text = f"{age_seconds / 60:.1f} 分钟"
+            elif age_seconds < 86400:
+                age_text = f"{age_seconds / 3600:.1f} 小时"
+            else:
+                age_text = f"{age_seconds / 86400:.1f} 天"
+        size = int(item.get("size") or 0)
+        actual_parts = [
+            f"白名单命中={', '.join(whitelist_hits) if whitelist_hits else '无'}",
+            f"白名单缺失={', '.join(whitelist_missing) if whitelist_missing else '无'}",
+            f"黑名单命中={', '.join(blacklist_hits) if blacklist_hits else '无'}",
+            f"画质={item.get('resolution') or '未知'}",
+            f"发种至今={age_text}",
+            f"体积={size / 1024 ** 3:.2f} GB" if size else "体积=未知",
+            f"促销={promotion_names.get(str(item.get('promotion') or 'unknown'), str(item.get('promotion') or '未知'))}",
+        ]
+        return "；".join(rule_parts), "；".join(actual_parts)
 
     def _find_added_hashes(
         self,
@@ -1421,12 +1506,35 @@ class BrushFlowTracker(_PluginBase):
             if "passkey" not in site and site.get("site_passkey"):
                 site["passkey"] = site.get("site_passkey")
             for rule in site.get("rss_rules") or []:
+                if "whitelist_keywords" not in rule:
+                    rule["whitelist_keywords"] = rule.get("required_keywords") or []
+                if "blacklist_keywords" not in rule:
+                    rule["blacklist_keywords"] = rule.get("excluded_keywords") or []
+                rule.pop("required_keywords", None)
+                rule.pop("excluded_keywords", None)
                 if "publish_age_to_minutes" not in rule and rule.get("max_age_minutes") is not None:
                     rule["publish_age_from_minutes"] = 0
                     rule["publish_age_to_minutes"] = rule.get("max_age_minutes")
                 if "size_from_gib" not in rule and rule.get("min_size_gib") is not None:
                     rule["size_from_gib"] = rule.get("min_size_gib")
                     rule["size_to_gib"] = None
+                if "publish_age_from_value" not in rule:
+                    rule["publish_age_from_value"] = rule.get("publish_age_from_minutes")
+                    rule["publish_age_from_unit"] = "minutes"
+                if "publish_age_to_value" not in rule:
+                    rule["publish_age_to_value"] = rule.get("publish_age_to_minutes")
+                    rule["publish_age_to_unit"] = "minutes"
+                if "size_from_value" not in rule:
+                    rule["size_from_value"] = rule.get("size_from_gib")
+                    rule["size_from_unit"] = "gib"
+                if "size_to_value" not in rule:
+                    rule["size_to_value"] = rule.get("size_to_gib")
+                    rule["size_to_unit"] = "gib"
+                for legacy_key in (
+                    "publish_age_from_minutes", "publish_age_to_minutes", "size_from_gib", "size_to_gib",
+                    "max_age_minutes", "min_size_gib",
+                ):
+                    rule.pop(legacy_key, None)
         data = SettingsPayload(**raw_config).model_dump()
         seen_sites = set()
         for site in data["sites"]:
