@@ -407,6 +407,109 @@ def test_adding_upgrade_removes_inferior_managed_task_and_files(plugin_module):
     assert "high" in plugin._state["managed"]
 
 
+def test_delayed_qb_hash_does_not_mistake_old_same_tag_task_for_new_upgrade(
+    plugin_module, monkeypatch
+):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    now = datetime(2026, 8, 13, 8, 0, tzinfo=timezone.utc)
+    standard = plugin_module.normalize_item({
+        "title": "Mystic.Nine.S01.2026.2160p.YK.WEB-DL.H265.HFR.HQ.DTS5.1-HHWEB",
+        "enclosure": "https://tracker.example/standard",
+        "size": 30 * 1024**3,
+    }, now)
+    dolby_vision = plugin_module.normalize_item({
+        "title": "Mystic.Nine.S01.2026.2160p.YK.WEB-DL.H265.DV.HFR.HQ.DTS5.1-HHWEB",
+        "enclosure": "https://tracker.example/dv",
+        "size": 31 * 1024**3,
+    }, now)
+    assert standard["media_key"] == dolby_vision["media_key"]
+    assert dolby_vision["quality_rank"] > standard["quality_rank"]
+    plugin._state["managed"]["old"] = {
+        "site_id": "a", "site_name": "Site A", "rule_id": "r", "rule_name": "Task A",
+        "title": standard["title"], "size": standard["size"], "added_at": now.isoformat(),
+    }
+
+    class DelayedHashDownloader:
+        def __init__(self):
+            self.new_visible = False
+            self.deleted = []
+
+        def get_torrents(self):
+            rows = [{
+                "hash": "OLD", "name": standard["title"], "tags": "Task A", "added_on": 1,
+            }]
+            if self.new_visible:
+                rows.append({
+                    "hash": "NEW", "name": dolby_vision["title"], "tags": "Task A", "added_on": 2,
+                })
+            return rows, False
+
+        def add_torrent(self, **_kwargs):
+            return True, []
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    monkeypatch.setattr(plugin_module.time, "sleep", lambda _seconds: None)
+    downloader = DelayedHashDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+
+    assert plugin._add_item(
+        {"id": "a", "name": "Site A"},
+        {"id": "r", "name": "Task A"},
+        dolby_vision,
+        service,
+    ) is True
+    assert "old" in plugin._state["managed"]
+    assert len(plugin._state["pending_managed"]) == 1
+    assert plugin._state["pending_managed"][0]["existing_hashes"] == ["old"]
+    assert plugin._state["pending_managed"][0]["replace_hashes"] == ["old"]
+    assert downloader.deleted == []
+
+    downloader.new_visible = True
+    torrents, _failed = downloader.get_torrents()
+    plugin._reconcile_pending_managed(service, torrents)
+
+    assert plugin._state["pending_managed"] == []
+    assert "new" in plugin._state["managed"]
+    assert "old" not in plugin._state["managed"]
+    assert downloader.deleted == [(["old"], True)]
+    assert [row["hash"] for row in torrents] == ["NEW"]
+
+
+def test_delayed_upgrade_retries_inferior_task_deletion(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    plugin._state["managed"]["old"] = {"site_id": "a", "title": "Show S01 2160p"}
+    plugin._state["pending_managed"] = [{
+        "site_id": "a", "rule_name": "Task A", "title": "Show S01 2160p DV",
+        "existing_hashes": ["old"], "replace_hashes": ["old"],
+    }]
+
+    class RetryDownloader:
+        def __init__(self):
+            self.attempts = 0
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.attempts += 1
+            return self.attempts > 1
+
+    downloader = RetryDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+    torrents = [{"hash": "NEW", "name": "Show S01 2160p DV", "tags": "Task A"}]
+
+    plugin._reconcile_pending_managed(service, torrents)
+    assert len(plugin._state["pending_managed"]) == 1
+    assert "old" in plugin._state["managed"]
+
+    plugin._reconcile_pending_managed(service, torrents)
+    assert plugin._state["pending_managed"] == []
+    assert "old" not in plugin._state["managed"]
+    assert "new" in plugin._state["managed"]
+
+
 def test_existing_duplicates_keep_best_quality_then_largest_size(plugin_module):
     plugin = plugin_module.BrushFlowTracker()
     plugin.init_plugin({})

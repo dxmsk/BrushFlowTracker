@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.15"
+    plugin_version = "1.1.16"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -1024,12 +1024,26 @@ class BrushFlowTracker(_PluginBase):
             if self._highest_resolution_dedup
             else []
         )
+        existing_hashes: Optional[set] = None
+        if hasattr(service.instance, "get_torrents"):
+            try:
+                before_add, failed = service.instance.get_torrents()
+                if not failed:
+                    existing_hashes = {
+                        str(row.get("hash") or "").lower()
+                        for row in before_add or []
+                        if row.get("hash")
+                    }
+            except Exception as error:
+                logger.warning(f"刷流追新添加前读取 qB 任务快照失败：{error}")
         success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
             return False
         hashes = [str(value).lower() for value in torrent_ids or [] if value]
         if not hashes:
-            hashes = self._find_added_hashes(service, task_name, item["title"])
+            hashes = self._find_added_hashes(
+                service, task_name, item["title"], existing_hashes=existing_hashes
+            )
         now = datetime.now().astimezone()
         identity = normalize_item(item, now)
         record = {
@@ -1051,12 +1065,16 @@ class BrushFlowTracker(_PluginBase):
             "tags": tags,
             "added_at": isoformat(now),
         }
+        replace_hashes = [torrent_hash for torrent_hash in inferior_hashes if torrent_hash not in set(hashes)]
         for torrent_hash in hashes:
             self._state["managed"][torrent_hash] = dict(record)
         if not hashes:
-            self._state["pending_managed"].append(dict(record))
+            self._state["pending_managed"].append({
+                **record,
+                "existing_hashes": sorted(existing_hashes or []),
+                "replace_hashes": replace_hashes,
+            })
         self._append_history({**record, "event": "added", "torrent_hashes": hashes})
-        replace_hashes = [torrent_hash for torrent_hash in inferior_hashes if torrent_hash not in set(hashes)]
         if replace_hashes and hashes:
             if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
                 for torrent_hash in replace_hashes:
@@ -1099,20 +1117,29 @@ class BrushFlowTracker(_PluginBase):
             f"链接={clean(item.get('enclosure'))}"
         )
 
-    def _find_added_hashes(self, service: Any, task_name: str, title: str) -> List[str]:
+    def _find_added_hashes(
+        self,
+        service: Any,
+        task_name: str,
+        title: str,
+        existing_hashes: Optional[set] = None,
+    ) -> List[str]:
         # 不依赖 qB 的 tag 过滤参数（旧版 MoviePilot/qB 对 tags 参数支持不一致），
         # 先取全部任务，再按本插件设置的任务标签和名称匹配。
-        fallback_matches = []
         for _attempt in range(3):
             torrents, failed = service.instance.get_torrents()
             if not failed:
                 matches = []
                 for item in torrents or []:
+                    torrent_hash = str(item.get("hash") or "").lower()
+                    if not torrent_hash or (
+                        existing_hashes is not None and torrent_hash in existing_hashes
+                    ):
+                        continue
                     tags = set(split_terms(item.get("tags")))
                     name = str(item.get("name") or "").strip()
                     if task_name not in tags:
                         continue
-                    fallback_matches.append(item)
                     if name == title.strip() or title.strip() in name or name in title.strip():
                         matches.append(item)
                 matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
@@ -1120,8 +1147,7 @@ class BrushFlowTracker(_PluginBase):
                     return [str(matches[0].get("hash") or "").lower()]
             if _attempt < 2:
                 time.sleep(0.4)
-        fallback_matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
-        return [str(fallback_matches[0].get("hash") or "").lower()] if fallback_matches else []
+        return []
 
     def _site_torrents(self, site: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         service, error = self._qb_service()
@@ -1214,16 +1240,50 @@ class BrushFlowTracker(_PluginBase):
         for record in pending:
             task_name = str(record.get("rule_name") or "").strip()
             title = str(record.get("title") or "").strip()
+            existing_hashes = {
+                str(value).lower() for value in record.get("existing_hashes") or [] if value
+            }
             matched_hash = None
             for item in torrents or []:
+                torrent_hash = str(item.get("hash") or "").lower()
+                if not torrent_hash or torrent_hash in existing_hashes:
+                    continue
                 tags = set(split_terms(item.get("tags")))
                 name = str(item.get("name") or "").strip()
                 if task_name in tags and title and (name == title or title in name or name in title):
-                    matched_hash = str(item.get("hash") or "").lower()
+                    matched_hash = torrent_hash
                     if matched_hash:
                         break
             if matched_hash:
-                self._state["managed"][matched_hash] = dict(record)
+                managed_record = dict(record)
+                replace_hashes = [
+                    str(value).lower()
+                    for value in managed_record.pop("replace_hashes", []) or []
+                    if value and str(value).lower() != matched_hash
+                ]
+                managed_record.pop("existing_hashes", None)
+                self._state["managed"][matched_hash] = managed_record
+                if replace_hashes:
+                    if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
+                        for torrent_hash in replace_hashes:
+                            old = self._state["managed"].get(torrent_hash, {})
+                            self._archive_managed(
+                                torrent_hash,
+                                f"同一资源已替换为更高画质或更大体积版本：{title}",
+                                site_id=managed_record.get("site_id"),
+                            )
+                            logger.info(
+                                f"刷流追新延迟确认新任务后替换较差版本：{old.get('title')} | 新版本={title}"
+                            )
+                        if isinstance(torrents, list):
+                            deleted_hashes = set(replace_hashes)
+                            torrents[:] = [
+                                item for item in torrents
+                                if str(item.get("hash") or "").lower() not in deleted_hashes
+                            ]
+                    else:
+                        remaining.append(record)
+                        logger.warning(f"刷流追新新任务已确认，但删除旧版本失败：{title}")
             else:
                 remaining.append(record)
         self._state["pending_managed"] = remaining
