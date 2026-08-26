@@ -781,3 +781,47 @@ def test_size_range_validation_compares_different_units(plugin_module):
                 "size_to_unit": "mib",
             }]}]
         )
+
+
+def test_state_save_failure_does_not_leave_rss_job_marked_running(plugin_module, monkeypatch):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    monkeypatch.setattr(plugin, "_qb_service", lambda *_args, **_kwargs: (None, "qB 离线"))
+    monkeypatch.setattr(plugin, "_save_state", lambda: (_ for _ in ()).throw(RuntimeError("storage offline")))
+
+    first = plugin.run_rss()
+    second = plugin.run_rss()
+
+    assert first["error"] == "qB 离线"
+    assert second["error"] == "qB 离线"
+    assert plugin._running_job_status() == {}
+
+
+def test_stale_job_lease_allows_next_run_and_old_run_cannot_clear_it(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    plugin._job_timeouts["rss"] = 1
+    old_token, _elapsed = plugin._start_job("rss", None)
+    plugin._running_jobs["rss"]["started_monotonic"] -= 2
+
+    new_token, elapsed = plugin._start_job("rss", "site-a")
+    plugin._finish_job("rss", old_token)
+
+    assert new_token and new_token != old_token
+    assert elapsed == 0
+    status = plugin._running_job_status()
+    assert status["rss"]["site_id"] == "site-a"
+    plugin._finish_job("rss", new_token)
+    assert plugin._running_job_status() == {}
+
+
+def test_active_job_is_still_skipped_before_lease_timeout(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    token, _elapsed = plugin._start_job("free_monitor", None)
+
+    next_token, elapsed = plugin._start_job("free_monitor", None)
+
+    assert next_token is None
+    assert elapsed >= 0
+    plugin._finish_job("free_monitor", token)

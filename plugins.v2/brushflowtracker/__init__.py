@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.17"
+    plugin_version = "1.1.18"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -134,9 +134,19 @@ class BrushFlowTracker(_PluginBase):
         self._sites = normalized["sites"]
         self._config = normalized
         self._site_auth_cache = {}
-        self._rss_lock = threading.Lock()
-        self._free_lock = threading.Lock()
-        self._cleanup_lock = threading.Lock()
+        # Do not replace these guards during a settings reload: MoviePilot can
+        # still hold a bound method for a job that was submitted before reload.
+        if not hasattr(self, "_job_guard"):
+            self._job_guard = threading.Lock()
+            self._running_jobs: Dict[str, Dict[str, Any]] = {}
+        if not hasattr(self, "_state_save_lock"):
+            self._state_save_lock = threading.Lock()
+        rss_rule_count = sum(len(site.get("rss_rules") or []) for site in self._sites)
+        self._job_timeouts = {
+            "rss": max(300, self._request_timeout_seconds * max(5, rss_rule_count)),
+            "free_monitor": max(120, self._request_timeout_seconds * 3),
+            "cleanup": max(120, self._request_timeout_seconds * 3),
+        }
         state = self.get_data(self.STATE_KEY) or {}
         self._state = {
             "dedup_records": dict(state.get("dedup_records") or {}),
@@ -254,6 +264,7 @@ class BrushFlowTracker(_PluginBase):
                 "downloader_error": downloader_error,
                 "managed_count": len(self._state["managed"]),
                 "dedup_count": len(self._state["dedup_records"]),
+                "running_jobs": self._running_job_status(),
             },
         )
 
@@ -292,9 +303,10 @@ class BrushFlowTracker(_PluginBase):
 
     def run_rss(self, site_id: Optional[str] = None) -> Dict[str, Any]:
         """抓取启用站点的 RSS，筛选并添加符合条件的种子。"""
-        if not self._rss_lock.acquire(blocking=False):
-            logger.info("刷流追新 RSS 任务仍在运行，本轮跳过")
-            return {"skipped": True}
+        job_token, elapsed = self._start_job("rss", site_id)
+        if not job_token:
+            logger.info(f"刷流追新 RSS 任务仍在运行（{elapsed} 秒），本轮跳过")
+            return {"skipped": True, "running_seconds": elapsed}
         started = datetime.now().astimezone()
         summary = Counter()
         try:
@@ -321,14 +333,14 @@ class BrushFlowTracker(_PluginBase):
             logger.error(f"刷流追新 RSS 任务失败：{str(err)}\n{traceback.format_exc()}")
             return {**dict(summary), "error": str(err)}
         finally:
-            self._save_state()
-            self._rss_lock.release()
+            self._finish_job("rss", job_token)
 
     def monitor_free_expiry(self, site_id: Optional[str] = None) -> Dict[str, Any]:
         """免费到期时删除尚未完成的托管任务及其未完成文件。"""
-        if not self._free_lock.acquire(blocking=False):
-            logger.info("刷流追新免费期监控仍在运行，本轮跳过")
-            return {"skipped": True}
+        job_token, elapsed = self._start_job("free_monitor", site_id)
+        if not job_token:
+            logger.info(f"刷流追新免费期监控仍在运行（{elapsed} 秒），本轮跳过")
+            return {"skipped": True, "running_seconds": elapsed}
         started = datetime.now().astimezone()
         result = Counter()
         try:
@@ -370,8 +382,7 @@ class BrushFlowTracker(_PluginBase):
             logger.error(f"刷流追新免费期监控失败：{str(err)}\n{traceback.format_exc()}")
             return {**dict(result), "error": str(err)}
         finally:
-            self._save_state()
-            self._free_lock.release()
+            self._finish_job("free_monitor", job_token)
 
     def _monitor_dead_seeds(
         self, service: Any, torrents: List[Dict[str, Any]], site_id: Optional[str] = None
@@ -445,9 +456,10 @@ class BrushFlowTracker(_PluginBase):
 
     def run_cleanup(self, site_id: Optional[str] = None) -> Dict[str, Any]:
         """按站点配置顺序应用首条命中的自动删种规则。"""
-        if not self._cleanup_lock.acquire(blocking=False):
-            logger.info("刷流追新删种任务仍在运行，本轮跳过")
-            return {"skipped": True}
+        job_token, elapsed = self._start_job("cleanup", site_id)
+        if not job_token:
+            logger.info(f"刷流追新删种任务仍在运行（{elapsed} 秒），本轮跳过")
+            return {"skipped": True, "running_seconds": elapsed}
         started = datetime.now().astimezone()
         result = Counter()
         try:
@@ -484,8 +496,7 @@ class BrushFlowTracker(_PluginBase):
             logger.error(f"刷流追新自动删种失败：{str(err)}\n{traceback.format_exc()}")
             return {**dict(result), "error": str(err)}
         finally:
-            self._save_state()
-            self._cleanup_lock.release()
+            self._finish_job("cleanup", job_token)
 
     def _scan_site(self, site: Dict[str, Any], service: Any, defer_add: bool = False) -> Counter:
         result = Counter()
@@ -1483,6 +1494,70 @@ class BrushFlowTracker(_PluginBase):
             "result": result,
             "error": error,
         }
+
+    def _start_job(self, operation: str, site_id: Optional[str]) -> Tuple[Optional[str], int]:
+        """Claim a job slot and recover a slot abandoned by a blocked I/O call.
+
+        Python cannot safely kill the thread that is blocked in a third-party
+        downloader or RSS client.  A lease therefore protects normal runs but
+        expires eventually, so one wedged request cannot disable this plugin
+        forever.  The token prevents the old thread from clearing a newer run.
+        """
+        now = time.monotonic()
+        timeout = self._job_timeouts[operation]
+        with self._job_guard:
+            current = self._running_jobs.get(operation)
+            if current:
+                elapsed = max(0, int(now - current["started_monotonic"]))
+                if elapsed < timeout:
+                    return None, elapsed
+                logger.error(
+                    f"刷流追新 {operation} 任务已运行 {elapsed} 秒，超过 {timeout} 秒保护时限；"
+                    "本轮将继续执行。请检查 RSS、qBittorrent 或插件数据存储的网络连接。"
+                )
+            token = uuid.uuid4().hex
+            self._running_jobs[operation] = {
+                "token": token,
+                "site_id": site_id,
+                "started_monotonic": now,
+                "started_at": isoformat(datetime.now().astimezone()),
+                "thread_id": threading.get_ident(),
+            }
+            return token, 0
+
+    def _finish_job(self, operation: str, token: str) -> None:
+        """Release the job slot before persistence so a stuck save cannot block work."""
+        with self._job_guard:
+            current = self._running_jobs.get(operation)
+            if current and current.get("token") == token:
+                self._running_jobs.pop(operation, None)
+        self._save_state_safely(operation)
+
+    def _running_job_status(self) -> Dict[str, Dict[str, Any]]:
+        """Expose current job leases to the management page and status API."""
+        now = time.monotonic()
+        with self._job_guard:
+            return {
+                operation: {
+                    "site_id": entry.get("site_id"),
+                    "started_at": entry.get("started_at"),
+                    "running_seconds": max(0, int(now - entry["started_monotonic"])),
+                    "timeout_seconds": self._job_timeouts.get(operation),
+                }
+                for operation, entry in self._running_jobs.items()
+            }
+
+    def _save_state_safely(self, operation: str) -> None:
+        """Persist state without letting storage failures hold a task lease forever."""
+        if not self._state_save_lock.acquire(blocking=False):
+            logger.warning(f"刷流追新 {operation} 状态保存仍在进行，本轮跳过保存")
+            return
+        try:
+            self._save_state()
+        except Exception as err:
+            logger.error(f"刷流追新 {operation} 状态保存失败：{err}\n{traceback.format_exc()}")
+        finally:
+            self._state_save_lock.release()
 
     def _save_state(self) -> None:
         self._state["processed_urls"] = dict(list(self._state["processed_urls"].items())[-20000:])
