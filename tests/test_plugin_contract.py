@@ -109,7 +109,7 @@ def test_default_plugin_contract(plugin_module):
     assert plugin.get_service() == []
     assert plugin.get_render_mode() == ("vue", "dist/assets")
     assert {route["path"] for route in plugin.get_api()} == {
-        "/status", "/settings", "/run", "/test-downloader"
+        "/status", "/tasks", "/settings", "/run", "/test-downloader"
     }
 
 
@@ -414,6 +414,9 @@ def test_adding_upgrade_removes_inferior_managed_task_and_files(plugin_module):
         def __init__(self):
             self.deleted = []
 
+        def get_torrents(self):
+            return [{"hash": "LOW", "name": low["title"], "progress": 0.5, "amount_left": 100}], False
+
         def add_torrent(self, **_kwargs):
             return True, ["HIGH"]
 
@@ -434,6 +437,42 @@ def test_adding_upgrade_removes_inferior_managed_task_and_files(plugin_module):
     assert downloader.deleted == [(["low"], True)]
     assert "low" not in plugin._state["managed"]
     assert "high" in plugin._state["managed"]
+
+
+def test_adding_upgrade_keeps_completed_inferior_task_and_files(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    now = datetime.now(timezone.utc)
+    low = plugin_module.normalize_item({
+        "title": "Example S01E01 1080p WEB-DL", "enclosure": "https://a.example/low",
+    }, now)
+    high = plugin_module.normalize_item({
+        "title": "Example S01E01 2160p WEB-DL", "enclosure": "https://a.example/high",
+    }, now)
+    plugin._state["managed"]["low"] = {"site_id": "a", "title": low["title"]}
+
+    class CompletedDownloader:
+        def __init__(self):
+            self.deleted = []
+
+        def get_torrents(self):
+            return [{
+                "hash": "LOW", "name": low["title"], "progress": 1.0, "amount_left": 0,
+            }], False
+
+        def add_torrent(self, **_kwargs):
+            return True, ["HIGH"]
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    downloader = CompletedDownloader()
+    service = type("SimpleService", (), {"instance": downloader})()
+
+    assert plugin._add_item({"id": "a", "name": "A"}, {"id": "r", "name": "追新"}, high, service)
+    assert downloader.deleted == []
+    assert set(plugin._state["managed"]) == {"low", "high"}
 
 
 def test_delayed_qb_hash_does_not_mistake_old_same_tag_task_for_new_upgrade(
@@ -573,6 +612,52 @@ def test_existing_duplicates_keep_best_quality_then_largest_size(plugin_module):
     assert plugin._deduplicate_managed_torrents(service, "a") == 2
     assert set(downloader.deleted) == {"sdr", "hdr-small"}
     assert set(plugin._state["managed"]) == {"hdr-large"}
+
+
+def test_existing_dedup_never_deletes_completed_duplicate(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    low_title = "Example S01E01 1080p WEB-DL"
+    high_title = "Example S01E01 2160p WEB-DL"
+    plugin._state["managed"] = {
+        "low": {"site_id": "a", "title": low_title},
+        "high": {"site_id": "a", "title": high_title},
+    }
+
+    class ExistingDownloader:
+        def __init__(self):
+            self.deleted = []
+
+        def get_torrents(self):
+            return [
+                {"hash": "LOW", "name": low_title, "progress": 1, "amount_left": 0},
+                {"hash": "HIGH", "name": high_title, "progress": 0.5, "amount_left": 100},
+            ], False
+
+        def delete_torrents(self, ids, delete_file=False):
+            self.deleted.append((ids, delete_file))
+            return True
+
+    downloader = ExistingDownloader()
+    service = type("Service", (), {"instance": downloader})()
+
+    assert plugin._deduplicate_managed_torrents(service) == 0
+    assert downloader.deleted == []
+    assert set(plugin._state["managed"]) == {"low", "high"}
+
+
+def test_lightweight_status_does_not_connect_to_qb(plugin_module, monkeypatch):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({"sites": [{"id": "a", "name": "A"}]})
+    monkeypatch.setattr(
+        plugin, "_qb_service", lambda *_args, **_kwargs: pytest.fail("lightweight status connected to qB")
+    )
+
+    response = plugin.get_status("a", include_tasks=False, include_downloaders=False)
+
+    assert response.success is True
+    assert response.data["tasks"] == []
+    assert response.data["downloaders"] == []
 
 
 def test_dead_seed_monitor_deletes_stalled_task_and_releases_dedup(plugin_module):

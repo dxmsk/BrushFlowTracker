@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.18"
+    plugin_version = "1.1.19"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -147,7 +147,23 @@ class BrushFlowTracker(_PluginBase):
             "free_monitor": max(120, self._request_timeout_seconds * 3),
             "cleanup": max(120, self._request_timeout_seconds * 3),
         }
-        state = self.get_data(self.STATE_KEY) or {}
+        if not hasattr(self, "_torrent_cache_lock"):
+            self._torrent_cache_lock = threading.Lock()
+            self._torrent_cache: Dict[str, Any] = {
+                "signature": None, "loaded_monotonic": 0.0, "torrents": [], "failed": True,
+            }
+        if not hasattr(self, "_custom_qb_cache_lock"):
+            self._custom_qb_cache_lock = threading.Lock()
+            self._custom_qb_cache: Dict[str, Any] = {
+                "signature": None, "loaded_monotonic": 0.0, "service": None,
+            }
+        if not hasattr(self, "_downloader_options_cached"):
+            self._downloader_options_cached: List[Dict[str, str]] = []
+            self._downloader_options_cached_at = 0.0
+        # Saving settings re-enters init_plugin on the same instance. Reuse the
+        # in-memory runtime state instead of reading and rebuilding a large JSON
+        # document on every save.
+        state = getattr(self, "_state", None) or self.get_data(self.STATE_KEY) or {}
         self._state = {
             "dedup_records": dict(state.get("dedup_records") or {}),
             "processed_urls": dict(state.get("processed_urls") or {}),
@@ -221,6 +237,7 @@ class BrushFlowTracker(_PluginBase):
         """注册首页和配置页所需的受保护 API。"""
         return [
             {"path": "/status", "endpoint": self.get_status, "methods": ["GET"], "auth": "bear", "summary": "获取刷流追新状态"},
+            {"path": "/tasks", "endpoint": self.get_tasks, "methods": ["GET"], "auth": "bear", "summary": "获取 qBittorrent 托管任务"},
             {"path": "/settings", "endpoint": self.save_settings, "methods": ["POST"], "auth": "bear", "summary": "保存刷流追新设置"},
             {"path": "/run", "endpoint": self.run_now, "methods": ["POST"], "auth": "bear", "summary": "立即执行任务"},
             {"path": "/test-downloader", "endpoint": self.test_downloader, "methods": ["POST"], "auth": "bear", "summary": "测试 qBittorrent"},
@@ -242,14 +259,19 @@ class BrushFlowTracker(_PluginBase):
     def stop_service(self) -> None:
         """插件没有自建线程池，后台任务由宿主调度器统一回收。"""
 
-    def get_status(self, site_id: Optional[str] = None) -> schemas.Response:
+    def get_status(
+        self,
+        site_id: Optional[str] = None,
+        include_tasks: bool = True,
+        include_downloaders: bool = True,
+    ) -> schemas.Response:
         """返回全局配置、站点统计和指定站点的 qBittorrent 任务。"""
         sites = [self._site_summary(site) for site in self._sites]
         selected_id = site_id or (sites[0]["id"] if sites else None)
         selected = self._find_site(selected_id)
         tasks: List[Dict[str, Any]] = []
         downloader_error = None
-        if selected:
+        if selected and include_tasks:
             tasks, downloader_error = self._site_torrents(selected)
             sites = [self._site_summary(site) for site in self._sites]
         return schemas.Response(
@@ -260,11 +282,28 @@ class BrushFlowTracker(_PluginBase):
                 "selected_site": selected,
                 "tasks": tasks,
                 "history": [row for row in reversed(self._state["history"]) if not selected_id or row.get("site_id") == selected_id][:100],
-                "downloaders": self._downloader_options(),
+                "downloaders": self._downloader_options() if include_downloaders else [],
                 "downloader_error": downloader_error,
                 "managed_count": len(self._state["managed"]),
                 "dedup_count": len(self._state["dedup_records"]),
                 "running_jobs": self._running_job_status(),
+            },
+        )
+
+    def get_tasks(self, site_id: Optional[str] = None, force: bool = False) -> schemas.Response:
+        """独立读取实时 qB 任务，使页面和设置无需等待下载器响应。"""
+        selected_id = site_id or (self._sites[0]["id"] if self._sites else None)
+        selected = self._find_site(selected_id)
+        tasks: List[Dict[str, Any]] = []
+        downloader_error = None
+        if selected:
+            tasks, downloader_error = self._site_torrents(selected, force=force)
+        return schemas.Response(
+            success=True,
+            data={
+                "tasks": tasks,
+                "downloader_error": downloader_error,
+                "sites": [self._site_summary(site) for site in self._sites],
             },
         )
 
@@ -274,10 +313,19 @@ class BrushFlowTracker(_PluginBase):
         self.update_config(config)
         self.init_plugin(config)
         try:
+            ThreadHelper().submit(self._refresh_scheduler)
+        except Exception as err:
+            logger.warning(f"刷流追新提交定时任务重建失败，将在插件重载后生效：{str(err)}")
+        # 保存接口只返回本地数据，不再同步查询 qB。旧版这里查询一次，
+        # 前端随后又查询一次，是保存操作明显迟缓的主要原因。
+        status = self.get_status(include_tasks=False, include_downloaders=False)
+        return schemas.Response(success=True, message="设置已保存", data=status.data)
+
+    def _refresh_scheduler(self) -> None:
+        try:
             Scheduler().update_plugin_job(self.__class__.__name__)
         except Exception as err:
             logger.warning(f"刷流追新重建定时任务失败，将在插件重载后生效：{str(err)}")
-        return schemas.Response(success=True, message="设置已保存", data=self.get_status().data)
 
     def run_now(self, payload: RunPayload) -> schemas.Response:
         """将指定维护操作提交到 MoviePilot 后台线程。"""
@@ -763,6 +811,53 @@ class BrushFlowTracker(_PluginBase):
                 inferior.append(str(torrent_hash).lower())
         return inferior
 
+    @staticmethod
+    def _torrent_is_complete(torrent: Optional[Dict[str, Any]]) -> bool:
+        """Use qB progress/remaining bytes to identify a safely completed task."""
+        if not torrent:
+            return False
+        try:
+            if torrent.get("progress") is not None and float(torrent.get("progress")) >= 0.999999:
+                return True
+        except (TypeError, ValueError):
+            pass
+        try:
+            return torrent.get("amount_left") is not None and int(torrent.get("amount_left")) <= 0
+        except (TypeError, ValueError):
+            return False
+
+    def _incomplete_replacement_hashes(
+        self,
+        hashes: List[str],
+        torrents: Optional[List[Dict[str, Any]]],
+        replacement_title: str,
+    ) -> List[str]:
+        """Never remove completed content as a side effect of quality deduplication."""
+        if not hashes:
+            return []
+        if torrents is None:
+            logger.warning(
+                f"刷流追新无法确认旧任务完成状态，本轮不删除重复内容：新版本={replacement_title}"
+            )
+            return []
+        torrent_map = {
+            str(torrent.get("hash") or "").lower(): torrent
+            for torrent in torrents
+            if torrent.get("hash")
+        }
+        deletable = []
+        for torrent_hash in hashes:
+            torrent = torrent_map.get(str(torrent_hash).lower())
+            if torrent and self._torrent_is_complete(torrent):
+                logger.info(
+                    f"刷流追新保留已下载完成的重复内容：{torrent.get('name')} | 新版本={replacement_title}"
+                )
+                continue
+            # A missing hash no longer exists in qB and does not need deletion.
+            if torrent:
+                deletable.append(str(torrent_hash).lower())
+        return deletable
+
     def _deduplicate_managed_torrents(self, service: Any, _site_id: Optional[str] = None) -> int:
         """Keep one best managed qB task globally for each media identity."""
         if not hasattr(service.instance, "get_torrents"):
@@ -816,6 +911,11 @@ class BrushFlowTracker(_PluginBase):
             }
             for torrent_hash, record, torrent in rows:
                 if torrent_hash == winner[0]:
+                    continue
+                if self._torrent_is_complete(torrent):
+                    logger.info(
+                        f"刷流追新去重保留已下载完成内容：{record.get('title')} | 最佳版本={winner_item['title']}"
+                    )
                     continue
                 if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
                     deleted += 1
@@ -1036,6 +1136,7 @@ class BrushFlowTracker(_PluginBase):
             else []
         )
         existing_hashes: Optional[set] = None
+        before_add: Optional[List[Dict[str, Any]]] = None
         if hasattr(service.instance, "get_torrents"):
             try:
                 before_add, failed = service.instance.get_torrents()
@@ -1045,7 +1146,10 @@ class BrushFlowTracker(_PluginBase):
                         for row in before_add or []
                         if row.get("hash")
                     }
+                else:
+                    before_add = None
             except Exception as error:
+                before_add = None
                 logger.warning(f"刷流追新添加前读取 qB 任务快照失败：{error}")
         success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
@@ -1076,7 +1180,11 @@ class BrushFlowTracker(_PluginBase):
             "tags": tags,
             "added_at": isoformat(now),
         }
-        replace_hashes = [torrent_hash for torrent_hash in inferior_hashes if torrent_hash not in set(hashes)]
+        replace_hashes = self._incomplete_replacement_hashes(
+            [torrent_hash for torrent_hash in inferior_hashes if torrent_hash not in set(hashes)],
+            before_add,
+            item["title"],
+        )
         for torrent_hash in hashes:
             self._state["managed"][torrent_hash] = dict(record)
         if not hashes:
@@ -1245,11 +1353,13 @@ class BrushFlowTracker(_PluginBase):
                 time.sleep(0.4)
         return []
 
-    def _site_torrents(self, site: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    def _site_torrents(
+        self, site: Dict[str, Any], force: bool = False
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         service, error = self._qb_service()
         if error:
             return [], error
-        torrents, failed = service.instance.get_torrents()
+        torrents, failed = self._ui_torrents(service, force=force)
         if failed:
             return [], "读取 qBittorrent 任务失败"
         self._reconcile_pending_managed(service, torrents)
@@ -1282,6 +1392,37 @@ class BrushFlowTracker(_PluginBase):
             if str(item.get("hash") or "").lower() in managed_hashes
             or bool(site_labels.intersection(split_terms(item.get("tags"))))
         ], None
+
+    def _ui_torrents(self, service: Any, force: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
+        """Reuse one short-lived qB snapshot while loading/switching site pages."""
+        signature = (
+            self._downloader_mode,
+            self._downloader,
+            self._config.get("custom_qb_url"),
+            self._config.get("custom_qb_host"),
+            self._config.get("custom_qb_port"),
+            self._config.get("custom_qb_username"),
+        )
+        now = time.monotonic()
+        with self._torrent_cache_lock:
+            cached = self._torrent_cache
+            if (
+                not force
+                and cached.get("signature") == signature
+                and not cached.get("failed")
+                and now - float(cached.get("loaded_monotonic") or 0) < 8
+            ):
+                return list(cached.get("torrents") or []), False
+        torrents, failed = service.instance.get_torrents()
+        if not failed:
+            with self._torrent_cache_lock:
+                self._torrent_cache = {
+                    "signature": signature,
+                    "loaded_monotonic": time.monotonic(),
+                    "torrents": list(torrents or []),
+                    "failed": False,
+                }
+        return list(torrents or []), bool(failed)
 
     def _recover_managed_by_tags(self, torrents: List[Dict[str, Any]]) -> None:
         """用任务名称标签恢复旧版本未保存成功的托管 hash。"""
@@ -1319,7 +1460,10 @@ class BrushFlowTracker(_PluginBase):
             changed = True
         if changed:
             self._migrate_managed_dedup_records()
-            self._save_state()
+            try:
+                ThreadHelper().submit(self._save_state_safely, "task_recovery")
+            except Exception as err:
+                logger.warning(f"刷流追新提交托管任务状态保存失败：{err}")
 
     def _reconcile_pending_managed(
         self, service: Any, torrents: Optional[List[Dict[str, Any]]] = None
@@ -1357,6 +1501,9 @@ class BrushFlowTracker(_PluginBase):
                     for value in managed_record.pop("replace_hashes", []) or []
                     if value and str(value).lower() != matched_hash
                 ]
+                replace_hashes = self._incomplete_replacement_hashes(
+                    replace_hashes, torrents, title
+                )
                 managed_record.pop("existing_hashes", None)
                 self._state["managed"][matched_hash] = managed_record
                 if replace_hashes:
@@ -1410,6 +1557,21 @@ class BrushFlowTracker(_PluginBase):
                 url = f"http://{url}"
             if urlsplit(url).port is None:
                 url = f"{url.rstrip('/')}:{port}"
+        signature = (
+            url,
+            str(config.get("custom_qb_username") or ""),
+            str(config.get("custom_qb_password") or ""),
+            str(config.get("custom_qb_save_path") or ""),
+            self._request_timeout_seconds,
+        )
+        with self._custom_qb_cache_lock:
+            cached = self._custom_qb_cache
+            if (
+                cached.get("signature") == signature
+                and cached.get("service") is not None
+                and time.monotonic() - float(cached.get("loaded_monotonic") or 0) < 300
+            ):
+                return cached["service"], None
         try:
             from qbittorrentapi import Client
 
@@ -1423,18 +1585,30 @@ class BrushFlowTracker(_PluginBase):
             client.auth_log_in()
             client.app_version()
             adapter = _CustomQBAdapter(client, str(config.get("custom_qb_save_path") or "").strip())
-            return SimpleNamespace(name="custom-qBittorrent", instance=adapter), None
+            service = SimpleNamespace(name="custom-qBittorrent", instance=adapter)
+            with self._custom_qb_cache_lock:
+                self._custom_qb_cache = {
+                    "signature": signature,
+                    "loaded_monotonic": time.monotonic(),
+                    "service": service,
+                }
+            return service, None
         except Exception as err:
             logger.warning(f"刷流追新自定义 qBittorrent 连接失败：{err}")
             return None, f"自定义 qBittorrent 连接失败：{err}"
 
     def _downloader_options(self) -> List[Dict[str, str]]:
+        if time.monotonic() - self._downloader_options_cached_at < 30:
+            return list(self._downloader_options_cached)
         try:
             services = DownloaderHelper().get_services(type_filter="qbittorrent")
-            return [{"title": name, "value": name} for name in services]
+            options = [{"title": name, "value": name} for name in services]
+            self._downloader_options_cached = options
+            self._downloader_options_cached_at = time.monotonic()
+            return list(options)
         except Exception as err:
             logger.warning(f"刷流追新读取 qBittorrent 服务失败：{str(err)}")
-            return []
+            return list(self._downloader_options_cached)
 
     def _target_sites(self, site_id: Optional[str]) -> List[Dict[str, Any]]:
         return [site for site in self._sites if site.get("enabled") and (not site_id or site["id"] == site_id)]

@@ -10,6 +10,7 @@ const props = defineProps({
 const emit = defineEmits(['action', 'close'])
 const hostToast = inject('moviepilot:toast', null)
 const loading = ref(false)
+const tasksLoading = ref(false)
 const saving = ref(false)
 const error = ref('')
 const activeTab = ref(props.initialTab)
@@ -22,6 +23,7 @@ const authDialog = computed({
 })
 const status = ref({ settings: { sites: [] }, sites: [], tasks: [], history: [], downloaders: [] })
 const draft = ref({ sites: [] })
+let taskRequestId = 0
 
 const pluginBase = 'plugin/BrushFlowTracker'
 const sites = computed(() => draft.value.sites || [])
@@ -82,12 +84,22 @@ function siteColor(index) {
   return ['#6d4aff', '#00897b', '#d96c00', '#0277bd', '#c62828', '#6d4c41'][index % 6]
 }
 
-async function loadStatus(preserveDraft = false) {
+async function loadStatus(preserveDraft = false, refreshTasks = true) {
   loading.value = true
   error.value = ''
   try {
-    const query = selectedSiteId.value ? `?site_id=${encodeURIComponent(selectedSiteId.value)}` : ''
-    status.value = unwrap(await props.api.get(`${pluginBase}/status${query}`))
+    const query = new URLSearchParams({
+      include_tasks: 'false',
+      include_downloaders: activeTab.value === 'settings' ? 'true' : 'false',
+    })
+    if (selectedSiteId.value) query.set('site_id', selectedSiteId.value)
+    const next = unwrap(await props.api.get(`${pluginBase}/status?${query}`))
+    status.value = {
+      ...status.value,
+      ...next,
+      tasks: status.value.tasks || [],
+      downloaders: next.downloaders?.length ? next.downloaders : (status.value.downloaders || []),
+    }
     if (!preserveDraft) draft.value = clone(status.value.settings || { sites: [] })
     const exists = sites.value.some(site => site.id === selectedSiteId.value)
     if (!exists) selectedSiteId.value = sites.value[0]?.id || ''
@@ -96,6 +108,37 @@ async function loadStatus(preserveDraft = false) {
   } finally {
     loading.value = false
   }
+  if (refreshTasks && activeTab.value === 'tasks' && selectedSiteId.value) loadTasks()
+}
+
+async function loadTasks(force = false) {
+  const siteId = selectedSiteId.value
+  if (!siteId) {
+    status.value.tasks = []
+    return
+  }
+  const requestId = ++taskRequestId
+  tasksLoading.value = true
+  try {
+    const query = new URLSearchParams({ site_id: siteId, force: force ? 'true' : 'false' })
+    const data = unwrap(await props.api.get(`${pluginBase}/tasks?${query}`))
+    if (requestId !== taskRequestId || siteId !== selectedSiteId.value) return
+    status.value = {
+      ...status.value,
+      tasks: data.tasks || [],
+      sites: data.sites || status.value.sites,
+      downloader_error: data.downloader_error || null,
+    }
+  } catch (err) {
+    if (requestId === taskRequestId) status.value.downloader_error = err?.message || '读取 qBittorrent 任务失败'
+  } finally {
+    if (requestId === taskRequestId) tasksLoading.value = false
+  }
+}
+
+function refreshPage() {
+  loadStatus(true, false)
+  if (activeTab.value === 'tasks') loadTasks(true)
 }
 
 async function selectSite(siteId) {
@@ -186,9 +229,14 @@ async function saveSettings() {
     payload.sites.forEach(site => site.rss_rules.forEach(rule => {
       rangeFields.forEach(key => { if (rule[key] === '') rule[key] = null })
     }))
-    status.value = unwrap(await props.api.post(`${pluginBase}/settings`, payload))
+    const data = unwrap(await props.api.post(`${pluginBase}/settings`, payload))
+    status.value = {
+      ...status.value,
+      ...data,
+      tasks: status.value.tasks || [],
+      downloaders: status.value.downloaders || [],
+    }
     draft.value = clone(status.value.settings)
-    await loadStatus(true)
     notify('配置已保存，定时任务已更新')
     emit('action')
   } catch (err) {
@@ -212,8 +260,11 @@ async function runOperation(operation) {
 }
 
 function scheduleStatusRefresh() {
-  for (const delay of [1500, 4000, 8000, 15000]) {
-    globalThis.setTimeout(() => loadStatus(true), delay)
+  for (const delay of [2000, 6000]) {
+    globalThis.setTimeout(() => {
+      loadStatus(true, false)
+      if (activeTab.value === 'tasks') loadTasks(true)
+    }, delay)
   }
 }
 
@@ -280,6 +331,10 @@ function formatDuration(seconds) {
 }
 
 watch(() => props.initialTab, value => { if (value) activeTab.value = value })
+watch(activeTab, value => {
+  if (value === 'tasks') loadTasks()
+  if (value === 'settings' && !status.value.downloaders?.length) loadStatus(true, false)
+})
 onMounted(() => loadStatus())
 </script>
 
@@ -291,7 +346,7 @@ onMounted(() => loadStatus())
         <div><h1>刷流追新</h1><p>一个 qBittorrent，统一托管多站点任务</p></div>
       </div>
       <div class="tracker__actions">
-        <VTooltip text="刷新数据"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-refresh" variant="text" :loading="loading" @click="loadStatus()" /></template></VTooltip>
+        <VTooltip text="刷新数据"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-refresh" variant="text" :loading="loading || tasksLoading" @click="refreshPage" /></template></VTooltip>
         <VBtn color="primary" variant="flat" prepend-icon="mdi-content-save" :loading="saving" @click="saveSettings">保存</VBtn>
         <VTooltip v-if="showClose" text="关闭"><template #activator="{ props: tip }"><VBtn v-bind="tip" icon="mdi-close" variant="text" @click="$emit('close')" /></template></VTooltip>
       </div>
@@ -349,7 +404,7 @@ onMounted(() => loadStatus())
               </div>
               <VSheet class="panel app-surface-static">
                 <header class="panel__head"><div><h2>本插件托管的 qBittorrent 任务</h2><p>{{ downloaderLabel }}</p></div><div><VBtn variant="tonal" prepend-icon="mdi-rss" :loading="saving" @click="runOperation('rss')">立即刷新</VBtn><VBtn variant="text" prepend-icon="mdi-broom" :loading="saving" @click="runOperation('cleanup')">检查删种</VBtn></div></header>
-                <VDataTable :headers="taskHeaders" :items="status.tasks || []" :loading="loading" density="comfortable" class="task-table">
+                <VDataTable :headers="taskHeaders" :items="status.tasks || []" :loading="tasksLoading" density="comfortable" class="task-table">
                   <template #item.name="{ item }"><div class="task-name"><strong>{{ item.name }}</strong><small>{{ formatBytes(item.size) }} · {{ item.tags.join(', ') }}</small></div></template>
                   <template #item.progress="{ item }"><div class="progress-cell"><span>{{ item.progress }}%</span><VProgressLinear :model-value="item.progress" height="5" rounded color="primary" /></div></template>
                   <template #item.ratio="{ item }">{{ Number(item.ratio || 0).toFixed(2) }}<small class="block-muted">{{ formatDuration(item.seeding_time) }}</small></template>
@@ -432,7 +487,7 @@ onMounted(() => loadStatus())
                     <VTextField v-model="draft.custom_qb_save_path" class="span-2" label="下载保存路径（可选）" placeholder="/downloads 或 D:\\Downloads" hide-details />
                     <VBtn class="span-2" variant="tonal" prepend-icon="mdi-connection" :loading="saving" @click="testDownloader">测试自定义 qBittorrent 连接</VBtn>
                   </template>
-                  <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="所有站点同一资源只保留最佳画质，同画质保留最大体积" color="primary" hide-details inset />
+                  <VSwitch v-model="draft.highest_resolution_dedup" class="span-2" label="重复下载只保留最佳版本（已下载完成的内容不会删除）" color="primary" hide-details inset />
                   <VSwitch v-model="draft.avoid_dead_seeds" class="span-2" label="避开无做种死种并自动切换可下载版本" color="warning" hide-details inset />
                   <VTextField v-model.number="draft.dead_seed_wait_minutes" type="number" min="1" label="死种等待时间" suffix="分钟" hide-details />
                   <VTextField v-model.number="draft.dead_seed_min_seeders" type="number" min="0" label="最低做种数" suffix="个" hide-details />
