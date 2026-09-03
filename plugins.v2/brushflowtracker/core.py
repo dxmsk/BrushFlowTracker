@@ -167,10 +167,11 @@ def _chinese_series_alias(text: str) -> Optional[str]:
     return alias if len(alias) >= 2 else None
 
 
-def media_key(title: str, context: str = "") -> str:
+def media_key(title: str, context: str = "", subtitle: str = "") -> str:
     """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
     raw_text = unicodedata.normalize("NFKC", title or "")
     context_text = unicodedata.normalize("NFKC", context or "")
+    subtitle_text = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", subtitle or "")).strip()
     alias = _chinese_series_alias(context_text) if context_text.strip() else None
     text = raw_text.upper()
     combined = f"{raw_text} {context_text}".upper()
@@ -184,6 +185,17 @@ def media_key(title: str, context: str = "") -> str:
         identity.append(f"S{season}")
     if episode_start is not None:
         identity.append(f"E{episode_start}-{episode_end}")
+    # Some feeds keep the actual edition/subject in RSS subtitle while sharing
+    # an identical main title. Descriptions are intentionally excluded because
+    # they often contain volatile site metadata.
+    if subtitle_text and episode_start is None:
+        subtitle_key = re.sub(
+            r"(?i)\b(?:8k|4k|uhd|4320p|2160p|2160i|1080p|1080i|720p|576p|480p|hdr10\+?|hdr|dv|dovi|web[- ]?dl|webrip|bluray|bdrip|remux|x26[45]|h26[45]|hevc|av1|aac|dts|truehd|atmos)\b",
+            " ", subtitle_text,
+        )
+        subtitle_key = re.sub(r"[\W_]+", " ", subtitle_key, flags=re.UNICODE).strip().upper()
+        if subtitle_key and not re.fullmatch(r"(?:E(?:PISODE)?\s*)?\d+(?:\s*[-~]\s*\d+)?", subtitle_key):
+            identity.append(f"SUB:{subtitle_key}")
     return hashlib.sha1("|".join(identity).encode("utf-8")).hexdigest()[:24]
 
 
@@ -369,6 +381,7 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         text = " ".join(str(value or "") for _key, value in fields)
         promotion = "2xfree" if (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text)) else "free"
     enclosure = _enclosure_from_raw(raw)
+    subtitle_value = str(_value_from_raw(raw, "subtitle") or "").strip()
     description = str(
         _value_from_raw(raw, "description")
         or _value_from_raw(raw, "summary")
@@ -393,7 +406,8 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         "resolution": resolution,
         "resolution_rank": rank,
         "quality_rank": quality_rank(title, rank),
-        "media_key": media_key(title, description),
+        "subtitle": subtitle_value,
+        "media_key": media_key(title, description, subtitle_value),
         "series_alias": _chinese_series_alias(
             f"{title} {description}"
         ),
