@@ -830,6 +830,25 @@ def test_pending_plugin_task_is_reconciled_and_only_managed_tasks_are_shown(plug
     assert plugin._state["pending_managed"] == []
 
 
+def test_unconfirmed_qb_submission_releases_processed_url_for_retry(plugin_module):
+    plugin = plugin_module.BrushFlowTracker()
+    plugin.init_plugin({})
+    link = "https://tracker.example/download.php?id=missing"
+    url_key = plugin_module.hashlib.sha1(link.encode("utf-8")).hexdigest()
+    plugin._state["processed_urls"][url_key] = datetime.now(timezone.utc).isoformat()
+    plugin._state["pending_managed"] = [{
+        "site_id": "a", "rule_name": "追新", "title": "Missing S01E01 2160P",
+        "link": link, "url_key": url_key, "existing_hashes": [], "confirm_attempts": 2,
+    }]
+    service = type("Service", (), {"instance": object()})()
+
+    plugin._reconcile_pending_managed(service, [])
+
+    assert plugin._state["pending_managed"] == []
+    assert url_key not in plugin._state["processed_urls"]
+    assert plugin._state["history"][-1]["event"] == "retry"
+
+
 def test_task_name_cannot_be_empty_or_contain_ascii_comma(plugin_module):
     with pytest.raises(ValueError, match="任务名称不能为空"):
         plugin_module.SettingsPayload(sites=[{"name": "A", "rss_rules": [{"name": " "}]}])

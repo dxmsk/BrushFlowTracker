@@ -7,6 +7,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html import unescape
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
@@ -349,7 +350,8 @@ def free_until_of(item: Dict[str, Any], now: Optional[datetime] = None) -> Optio
 
 def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
     """把 MoviePilot RSS 结果标准化为选种流程使用的字段。"""
-    title = str(raw.get("title") or "").strip()
+    raw = _coerce_mapping(raw)
+    title = str(_value_from_raw(raw, "title") or "").strip()
     resolution, rank = detect_resolution(title)
     fields = list(_iter_fields(raw))
     pubdate_value = _field_value(
@@ -366,20 +368,34 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
         text = " ".join(str(value or "") for _key, value in fields)
         promotion = "2xfree" if (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text)) else "free"
-    enclosure = str(raw.get("enclosure") or raw.get("link") or "").strip()
+    enclosure = _enclosure_from_raw(raw)
+    description = str(
+        _value_from_raw(raw, "description")
+        or _value_from_raw(raw, "summary")
+        or _value_from_raw(raw, "subtitle")
+        or _value_from_raw(raw, "content")
+        or ""
+    )
+    if not pubdate:
+        pubdate = _pubdate_from_text(f"{title} {description}", now)
+    size_value = _field_value(fields, {"size", "length", "filesize", "contentlength"})
+    size = int(_number(size_value, 0) or 0)
+    if size <= 0:
+        size = _size_from_text(str(size_value or "")) or _size_from_text(f"{title} {description}")
     return {
         **raw,
         "title": title,
+        "description": description,
         "enclosure": enclosure,
-        "size": int(_number(_field_value(fields, {"size", "length", "filesize", "contentlength"}), 0) or 0),
+        "size": size,
         "seeders": seed_availability(raw),
         "pubdate": pubdate,
         "resolution": resolution,
         "resolution_rank": rank,
         "quality_rank": quality_rank(title, rank),
-        "media_key": media_key(title, str(raw.get("description") or raw.get("subtitle") or raw.get("summary") or "")),
+        "media_key": media_key(title, description),
         "series_alias": _chinese_series_alias(
-            f"{title} {raw.get('description') or raw.get('subtitle') or raw.get('summary') or ''}"
+            f"{title} {description}"
         ),
         "promotion": promotion,
         "promotion_known": promotion_known(raw) or bool(free_until),
@@ -520,6 +536,74 @@ def _number(value: Any, default: Optional[float]) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    """Accept dicts as well as RSS item objects returned by older MoviePilot builds."""
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    try:
+        return dict(vars(value))
+    except (TypeError, ValueError):
+        return {}
+
+
+def _value_from_raw(raw: Dict[str, Any], key: str) -> Any:
+    value = raw.get(key)
+    if value not in (None, ""):
+        return value
+    try:
+        return getattr(raw, key)
+    except AttributeError:
+        return None
+
+
+def _enclosure_from_raw(raw: Dict[str, Any]) -> str:
+    """Extract URL from string, RSS enclosure object, or common URL aliases."""
+    value = _value_from_raw(raw, "enclosure")
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("href") or value.get("link")
+    elif isinstance(value, (list, tuple)) and value:
+        first = value[0]
+        value = first.get("url") if isinstance(first, dict) else first
+    if not value:
+        for key in ("download_url", "downloadurl", "torrent_url", "torrenturl", "url", "link", "guid"):
+            candidate = _value_from_raw(raw, key)
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url") or candidate.get("href")
+            if candidate:
+                value = candidate
+                break
+    return str(value or "").strip()
+
+
+def _size_from_text(text: str) -> int:
+    """Read human-readable sizes such as `4.01 GB` from RSS descriptions."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(KiB|KB|MiB|MB|GiB|GB|TiB|TB)\b", cleaned, re.I)
+    if not match:
+        return 0
+    # PT sites generally label binary torrent sizes as KB/MB/GB/TB. Use the
+    # same basis as the rule controls so a displayed 4.01 GB satisfies 4 GB.
+    factors = {"kib": 1024, "kb": 1024, "mib": 1024 ** 2, "mb": 1024 ** 2, "gib": 1024 ** 3, "gb": 1024 ** 3, "tib": 1024 ** 4, "tb": 1024 ** 4}
+    return int(float(match.group(1)) * factors[match.group(2).casefold()])
+
+
+def _pubdate_from_text(text: str, now: Optional[datetime]) -> Optional[datetime]:
+    """Recover publication time when a tracker embeds it only in RSS HTML."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(
+        r"(?:发布时间|發佈時間|发布于|發佈於|published(?:\s+at)?|posted(?:\s+at)?)\s*[:：]?\s*"
+        r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?)",
+        cleaned,
+        re.I,
+    )
+    return parse_datetime(match.group(1).replace("/", "-").replace(".", "-"), now) if match else None
 
 
 def _iter_fields(value: Any, key: str = "") -> Iterable[Tuple[str, Any]]:

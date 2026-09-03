@@ -308,3 +308,55 @@ def test_promotion_known_distinguishes_missing_from_explicit_normal_factor():
     normal = core.normalize_item({"title": "Example", "enclosure": "https://x/n", "downloadfactor": 1})
     assert unknown["promotion_known"] is False
     assert normal["promotion_known"] is True
+
+
+def test_screenshot_style_rss_item_matches_time_size_and_free_rules():
+    now = datetime(2026, 9, 3, 15, 29, 31, tzinfo=timezone.utc)
+    item = core.normalize_item(
+        {
+            "title": "Pull Strings S01 2026 2160p YK WEB-DL H.265 DV HQ AAC2.0-HHWEB",
+            "content": (
+                "<b>听见太稳健 / 我师兄实在太稳健了 | 第26集</b> "
+                "<span>免费 剩余时间：4时59分</span> 大小：4.01 GB "
+                "发布时间：2026-09-03 12:30:31"
+            ),
+            "enclosure": {"url": "https://tracker.example/download.php?id=26"},
+        },
+        now,
+    )
+    rule = {
+        "whitelist_keywords": ["Pull Strings"],
+        "resolutions": ["4K"],
+        "publish_age_from_value": 0,
+        "publish_age_from_unit": "hours",
+        "publish_age_to_value": 3,
+        "publish_age_to_unit": "hours",
+        "size_from_value": 4,
+        "size_from_unit": "gib",
+        "promotion": "free_or_2xfree",
+    }
+
+    assert item["enclosure"] == "https://tracker.example/download.php?id=26"
+    assert item["description"].startswith("<b>听见太稳健")
+    assert item["size"] > 4 * 1024 ** 3
+    assert item["pubdate"] == datetime(2026, 9, 3, 12, 30, 31, tzinfo=timezone.utc)
+    assert item["promotion"] == "free"
+    assert core.match_rule(item, rule, now) == (True, "命中")
+
+
+def test_human_readable_enclosure_length_is_parsed_as_binary_gb():
+    item = core.normalize_item({
+        "title": "Pull Strings S01E27 2026 2160p WEB-DL",
+        "enclosure": "https://tracker.example/27.torrent",
+        "length": "3.24 GB",
+    })
+    assert item["size"] == int(3.24 * 1024 ** 3)
+
+
+def test_subtitle_is_normalized_into_description_for_keyword_matching():
+    item = core.normalize_item({
+        "title": "Pull Strings S01E27 2026 2160p WEB-DL",
+        "subtitle": "听见太稳健 第27集",
+        "enclosure": "https://tracker.example/27.torrent",
+    })
+    assert core.match_rule(item, {"whitelist_keywords": ["听见太稳健"]}) == (True, "命中")

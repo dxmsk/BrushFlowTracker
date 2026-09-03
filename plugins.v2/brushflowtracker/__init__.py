@@ -104,7 +104,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.19"
+    plugin_version = "1.1.20"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -363,6 +363,8 @@ class BrushFlowTracker(_PluginBase):
                 raise RuntimeError(error)
             if self._highest_resolution_dedup:
                 summary["replaced"] += self._deduplicate_managed_torrents(service, site_id)
+            else:
+                self._reconcile_pending_managed(service)
             self._pending_candidates = []
             target_sites = self._target_sites(site_id)
             site_results: Dict[str, Counter] = {}
@@ -1190,6 +1192,8 @@ class BrushFlowTracker(_PluginBase):
         if not hashes:
             self._state["pending_managed"].append({
                 **record,
+                "url_key": hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest(),
+                "confirm_attempts": 0,
                 "existing_hashes": sorted(existing_hashes or []),
                 "replace_hashes": replace_hashes,
             })
@@ -1505,6 +1509,8 @@ class BrushFlowTracker(_PluginBase):
                     replace_hashes, torrents, title
                 )
                 managed_record.pop("existing_hashes", None)
+                managed_record.pop("url_key", None)
+                managed_record.pop("confirm_attempts", None)
                 self._state["managed"][matched_hash] = managed_record
                 if replace_hashes:
                     if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
@@ -1528,7 +1534,28 @@ class BrushFlowTracker(_PluginBase):
                         remaining.append(record)
                         logger.warning(f"刷流追新新任务已确认，但删除旧版本失败：{title}")
             else:
-                remaining.append(record)
+                attempts = int(record.get("confirm_attempts") or 0) + 1
+                added_at = parse_datetime(record.get("added_at"), datetime.now().astimezone())
+                age_seconds = (
+                    (datetime.now().astimezone() - added_at).total_seconds()
+                    if added_at else 0
+                )
+                if attempts >= 3 or age_seconds >= 300:
+                    url_key = str(record.get("url_key") or "").strip()
+                    if not url_key and record.get("link"):
+                        url_key = hashlib.sha1(str(record["link"]).encode("utf-8")).hexdigest()
+                    if url_key:
+                        self._state["processed_urls"].pop(url_key, None)
+                    self._append_history({
+                        **record,
+                        "event": "retry",
+                        "outcome": "重试",
+                        "reason": "qBittorrent 中未确认到已提交任务，已解除下载链接记录",
+                    })
+                    logger.warning(f"刷流追新未在 qBittorrent 确认到任务，将允许 RSS 重试：{title}")
+                else:
+                    record["confirm_attempts"] = attempts
+                    remaining.append(record)
         self._state["pending_managed"] = remaining
 
     def _qb_service(
