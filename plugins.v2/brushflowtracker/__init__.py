@@ -97,6 +97,22 @@ class _CustomQBAdapter:
             logger.warning(f"刷流追新自定义 qB 删除任务失败：{err}")
             return False
 
+    def pause_torrents(self, ids: List[str]):
+        try:
+            self.client.torrents_pause(torrent_hashes=ids)
+            return True
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qB 暂停任务失败：{err}")
+            return False
+
+    def resume_torrents(self, ids: List[str]):
+        try:
+            self.client.torrents_resume(torrent_hashes=ids)
+            return True
+        except Exception as err:
+            logger.warning(f"刷流追新自定义 qB 恢复任务失败：{err}")
+            return False
+
 
 class BrushFlowTracker(_PluginBase):
     """使用一个 qBittorrent 连接管理多站点 RSS 追新与刷流任务。"""
@@ -104,7 +120,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.21"
+    plugin_version = "1.1.22"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -402,6 +418,7 @@ class BrushFlowTracker(_PluginBase):
                 raise RuntimeError("读取 qBittorrent 任务失败")
             self._reconcile_pending_managed(service, torrents)
             self._recover_managed_by_tags(torrents)
+            result["replacement_deleted"] += self._finalize_replacements(service, torrents)
             result["dead_seed_deleted"] += self._monitor_dead_seeds(service, torrents, site_id)
             torrent_map = {str(item.get("hash") or "").lower(): item for item in torrents or []}
             now = datetime.now().astimezone()
@@ -420,6 +437,10 @@ class BrushFlowTracker(_PluginBase):
                 if progress >= 1 and amount_left <= 0:
                     record["free_until"] = None
                     result["completed"] += 1
+                    continue
+                if not self._has_completed_media_copy(record, torrents):
+                    result["protected"] += 1
+                    logger.info(f"刷流追新免费到期保护未完成最后任务：{record.get('title')}")
                     continue
                 if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
                     result["deleted"] += 1
@@ -454,6 +475,9 @@ class BrushFlowTracker(_PluginBase):
             speed = int(torrent.get("dlspeed") or 0)
             if progress >= 1 or int(torrent.get("amount_left") or 0) <= 0:
                 watch.pop(torrent_hash, None)
+                continue
+            if not self._has_completed_media_copy(record, torrents):
+                logger.info(f"刷流追新保护未完成追新任务不删除：{record.get('title')} | 尚无完整副本")
                 continue
             raw_seeds = torrent.get("num_seeds")
             if raw_seeds is None:
@@ -521,6 +545,7 @@ class BrushFlowTracker(_PluginBase):
                 raise RuntimeError("读取 qBittorrent 任务失败")
             self._reconcile_pending_managed(service, torrents)
             self._recover_managed_by_tags(torrents)
+            result["replacement_deleted"] += self._finalize_replacements(service, torrents)
             for site in self._target_sites(site_id):
                 rules = site.get("cleanup_rules") or []
                 if not rules:
@@ -532,6 +557,10 @@ class BrushFlowTracker(_PluginBase):
                         continue
                     rule = first_cleanup_rule(torrent, rules)
                     if not rule:
+                        continue
+                    if not self._torrent_is_complete(torrent) and not self._has_completed_media_copy(managed, torrents):
+                        result["protected"] += 1
+                        logger.info(f"刷流追新自动删种保护未完成最后任务：{torrent.get('name')}")
                         continue
                     result["matched"] += 1
                     if service.instance.delete_torrents(ids=[torrent_hash], delete_file=bool(rule.get("delete_files"))):
@@ -828,6 +857,28 @@ class BrushFlowTracker(_PluginBase):
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _pause_torrents(instance: Any, hashes: List[str]) -> bool:
+        """Pause old candidates during an upgrade; deletion is deferred until replacement completes."""
+        if not hashes:
+            return True
+        try:
+            method = getattr(instance, "pause_torrents", None)
+            if callable(method):
+                return bool(method(ids=hashes))
+            client = getattr(instance, "client", None)
+            method = getattr(client, "torrents_pause", None)
+            if callable(method):
+                method(torrent_hashes=hashes)
+                return True
+        except Exception as err:
+            logger.warning(f"刷流追新暂停旧版本失败：{err}")
+        return False
+
+    @staticmethod
+    def _has_completed_in_group(rows: List[Tuple[str, Dict[str, Any], Dict[str, Any]]]) -> bool:
+        return any(BrushFlowTracker._torrent_is_complete(row[2]) for row in rows)
+
     def _incomplete_replacement_hashes(
         self,
         hashes: List[str],
@@ -859,6 +910,37 @@ class BrushFlowTracker(_PluginBase):
             if torrent:
                 deletable.append(str(torrent_hash).lower())
         return deletable
+
+    def _has_completed_media_copy(self, record: Dict[str, Any], torrents: List[Dict[str, Any]]) -> bool:
+        key = str(record.get("media_key") or "")
+        if not key:
+            return False
+        torrent_map = {str(t.get("hash") or "").lower(): t for t in torrents or []}
+        return any(
+            str(other.get("media_key") or "") == key and self._torrent_is_complete(torrent_map.get(str(h).lower()))
+            for h, other in self._state.get("managed", {}).items()
+        )
+
+    def _finalize_replacements(self, service: Any, torrents: List[Dict[str, Any]]) -> int:
+        """Delete paused inferior tasks only after their replacement is complete."""
+        torrent_map = {str(t.get("hash") or "").lower(): t for t in torrents or []}
+        deleted = 0
+        handled = set()
+        for new_hash, record in list(self._state.get("managed", {}).items()):
+            old_hashes = [str(value).lower() for value in (record.get("replacement_for") or [])]
+            if not old_hashes or new_hash in handled:
+                continue
+            if not self._torrent_is_complete(torrent_map.get(str(new_hash).lower())):
+                continue
+            deletable = [h for h in old_hashes if h in torrent_map and not self._torrent_is_complete(torrent_map[h])]
+            if deletable and service.instance.delete_torrents(ids=deletable, delete_file=True):
+                deleted += len(deletable)
+                for old_hash in deletable:
+                    self._archive_managed(old_hash, f"替代任务已完成，清理旧版本：{record.get('title')}")
+                logger.info(f"刷流追新替代任务已完成，删除旧版本：{record.get('title')}")
+            record.pop("replacement_for", None)
+            handled.add(new_hash)
+        return deleted
 
     def _deduplicate_managed_torrents(self, service: Any, _site_id: Optional[str] = None) -> int:
         """Keep one best managed qB task globally for each media identity."""
@@ -894,6 +976,7 @@ class BrushFlowTracker(_PluginBase):
 
         deleted = 0
         for key, rows in groups.items():
+            has_completed = self._has_completed_in_group(rows)
             winner = max(
                 rows,
                 key=lambda row: (
@@ -917,6 +1000,12 @@ class BrushFlowTracker(_PluginBase):
                 if self._torrent_is_complete(torrent):
                     logger.info(
                         f"刷流追新去重保留已下载完成内容：{record.get('title')} | 最佳版本={winner_item['title']}"
+                    )
+                    continue
+                if not has_completed:
+                    self._pause_torrents(service.instance, [torrent_hash])
+                    logger.info(
+                        f"刷流追新保护资源最后一个未完成任务：{record.get('title')} | 尚无完整副本"
                     )
                     continue
                 if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
@@ -1187,8 +1276,14 @@ class BrushFlowTracker(_PluginBase):
             before_add,
             item["title"],
         )
+        if replace_hashes:
+            # Keep the old candidate as a recovery path until the new one is complete.
+            self._pause_torrents(service.instance, replace_hashes)
         for torrent_hash in hashes:
-            self._state["managed"][torrent_hash] = dict(record)
+            managed_record = dict(record)
+            if replace_hashes:
+                managed_record["replacement_for"] = list(replace_hashes)
+            self._state["managed"][torrent_hash] = managed_record
         if not hashes:
             self._state["pending_managed"].append({
                 **record,
@@ -1198,20 +1293,8 @@ class BrushFlowTracker(_PluginBase):
                 "replace_hashes": replace_hashes,
             })
         self._append_history({**record, "event": "added", "torrent_hashes": hashes})
-        if replace_hashes and hashes:
-            if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
-                for torrent_hash in replace_hashes:
-                    old = self._state["managed"].get(torrent_hash, {})
-                    self._archive_managed(
-                        torrent_hash,
-                        f"同一资源已替换为更高画质或更大体积版本：{item['title']}",
-                        site_id=site["id"],
-                    )
-                    logger.info(f"刷流追新替换较差版本：{old.get('title')} | 新版本={item['title']}")
-            else:
-                logger.warning(f"刷流追新已添加优质版本，但删除旧版本失败：{item['title']}")
-        elif replace_hashes:
-            logger.warning(f"刷流追新已添加优质版本但尚未确认新任务 hash，暂不删除旧版本：{item['title']}")
+        if replace_hashes:
+            logger.info(f"刷流追新已暂停旧版本，等待新版本完成后再删除：{item['title']}")
         if item["promotion"] != "normal" and not item.get("free_until"):
             logger.warning(f"刷流追新已添加免费种但无法识别截止时间：{item['title']}")
         logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
@@ -1511,28 +1594,12 @@ class BrushFlowTracker(_PluginBase):
                 managed_record.pop("existing_hashes", None)
                 managed_record.pop("url_key", None)
                 managed_record.pop("confirm_attempts", None)
+                if replace_hashes:
+                    managed_record["replacement_for"] = list(replace_hashes)
                 self._state["managed"][matched_hash] = managed_record
                 if replace_hashes:
-                    if service.instance.delete_torrents(ids=replace_hashes, delete_file=True):
-                        for torrent_hash in replace_hashes:
-                            old = self._state["managed"].get(torrent_hash, {})
-                            self._archive_managed(
-                                torrent_hash,
-                                f"同一资源已替换为更高画质或更大体积版本：{title}",
-                                site_id=managed_record.get("site_id"),
-                            )
-                            logger.info(
-                                f"刷流追新延迟确认新任务后替换较差版本：{old.get('title')} | 新版本={title}"
-                            )
-                        if isinstance(torrents, list):
-                            deleted_hashes = set(replace_hashes)
-                            torrents[:] = [
-                                item for item in torrents
-                                if str(item.get("hash") or "").lower() not in deleted_hashes
-                            ]
-                    else:
-                        remaining.append(record)
-                        logger.warning(f"刷流追新新任务已确认，但删除旧版本失败：{title}")
+                    self._pause_torrents(service.instance, replace_hashes)
+                    logger.info(f"刷流追新新任务已确认，旧版本已暂停，等待新版本完成：{title}")
             else:
                 attempts = int(record.get("confirm_attempts") or 0) + 1
                 added_at = parse_datetime(record.get("added_at"), datetime.now().astimezone())
