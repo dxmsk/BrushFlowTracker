@@ -25,6 +25,47 @@ def test_media_key_ignores_release_quality_but_keeps_episode_identity():
     assert first != next_episode
 
 
+def test_subtitle_only_distinguishes_episode_not_platform_or_release_notes():
+    title = "Call.Me.By.Fire.S06.2026.2160p.WEB-DL.H265.AAC"
+    adweb = core.normalize_item({
+        "title": f"{title}-ADWeb",
+        "subtitle": "披荆斩棘 第01期 | 芒果TV | 官方",
+        "enclosure": "https://x/adweb",
+        "size": 14.62 * 1024**3,
+    })
+    hhweb = core.normalize_item({
+        "title": f"{title}2.0-HHWEB",
+        "subtitle": "披荆斩棘 第01期 | 会员版 | HHWEB",
+        "enclosure": "https://x/hhweb",
+        "size": 14.63 * 1024**3,
+    })
+    next_episode = core.normalize_item({
+        "title": f"{title}-ADWeb",
+        "subtitle": "披荆斩棘 第02期 | 芒果TV | 官方",
+        "enclosure": "https://x/episode-2",
+    })
+
+    assert adweb["media_key"] == hhweb["media_key"]
+    assert adweb["media_key"] != next_episode["media_key"]
+    assert core.choose_highest([adweb, hhweb]) == [adweb]
+
+
+def test_season_pack_ignores_different_platform_subtitles():
+    adweb = core.normalize_item({
+        "title": "Call.Me.By.Fire.S06.2026.2160p.WEB-DL.H265.AAC-ADWeb",
+        "subtitle": "披荆斩棘 第六季 | 芒果TV | 官方",
+        "enclosure": "https://x/season-adweb",
+    })
+    hhweb = core.normalize_item({
+        "title": "Call.Me.By.Fire.S06.2026.2160p.WEB-DL.H265.AAC2.0-HHWEB",
+        "subtitle": "披荆斩棘 第六季 | 会员版 | HHWEB",
+        "enclosure": "https://x/season-hhweb",
+    })
+
+    assert adweb["media_key"] == hhweb["media_key"]
+    assert len(core.choose_highest([adweb, hhweb])) == 1
+
+
 def test_same_episode_hdr_and_sdr_share_identity_and_hdr_wins():
     hdr_title = (
         "The Mystic Nine S01E23 2026 2160p WEB-DL H265 HDR DTS-ADWeb "

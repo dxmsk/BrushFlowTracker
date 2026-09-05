@@ -120,7 +120,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.22"
+    plugin_version = "1.1.23"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -731,6 +731,8 @@ class BrushFlowTracker(_PluginBase):
 
     def _site_dedup_allows(self, site_id: str, item: Dict[str, Any]) -> bool:
         record = self._state["dedup_records"].get(self._site_media_key(site_id, item))
+        if record and record.get("completed"):
+            return False
         return record is None or self._selection_preference(item) > self._selection_preference(record)
 
     def _selection_preference(self, item: Dict[str, Any]) -> Tuple[int, ...]:
@@ -992,6 +994,7 @@ class BrushFlowTracker(_PluginBase):
                 "resolution_rank": winner_item["resolution_rank"],
                 "quality_rank": winner_item["quality_rank"],
                 "size": winner_item["size"],
+                "completed": has_completed,
                 "updated_at": isoformat(datetime.now().astimezone()),
             }
             for torrent_hash, record, torrent in rows:

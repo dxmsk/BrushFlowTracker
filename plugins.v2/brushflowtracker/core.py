@@ -172,9 +172,10 @@ def media_key(title: str, context: str = "", subtitle: str = "") -> str:
     raw_text = unicodedata.normalize("NFKC", title or "")
     context_text = unicodedata.normalize("NFKC", context or "")
     subtitle_text = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", subtitle or "")).strip()
-    alias = _chinese_series_alias(context_text) if context_text.strip() else None
+    metadata_text = f"{context_text} {subtitle_text}".strip()
+    alias = _chinese_series_alias(metadata_text) if metadata_text else None
     text = raw_text.upper()
-    combined = f"{raw_text} {context_text}".upper()
+    combined = f"{raw_text} {metadata_text}".upper()
     series = _canonical_series_title(text)
     season, episode_start, episode_end = _episode_identity(combined)
     if alias:
@@ -185,17 +186,6 @@ def media_key(title: str, context: str = "", subtitle: str = "") -> str:
         identity.append(f"S{season}")
     if episode_start is not None:
         identity.append(f"E{episode_start}-{episode_end}")
-    # Some feeds keep the actual edition/subject in RSS subtitle while sharing
-    # an identical main title. Descriptions are intentionally excluded because
-    # they often contain volatile site metadata.
-    if subtitle_text and episode_start is None:
-        subtitle_key = re.sub(
-            r"(?i)\b(?:8k|4k|uhd|4320p|2160p|2160i|1080p|1080i|720p|576p|480p|hdr10\+?|hdr|dv|dovi|web[- ]?dl|webrip|bluray|bdrip|remux|x26[45]|h26[45]|hevc|av1|aac|dts|truehd|atmos)\b",
-            " ", subtitle_text,
-        )
-        subtitle_key = re.sub(r"[\W_]+", " ", subtitle_key, flags=re.UNICODE).strip().upper()
-        if subtitle_key and not re.fullmatch(r"(?:E(?:PISODE)?\s*)?\d+(?:\s*[-~]\s*\d+)?", subtitle_key):
-            identity.append(f"SUB:{subtitle_key}")
     return hashlib.sha1("|".join(identity).encode("utf-8")).hexdigest()[:24]
 
 

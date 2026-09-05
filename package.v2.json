@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-  "version": "1.1.22",
+  "version": "1.1.23",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+    "v1.1.23": "修复相同季集因副标题中的平台、发布组或说明差异被重复下载；副标题仅用于提取剧名和季集身份，已有完整副本时不再新增同资源任务。",
     "v1.1.22": "采用完成保障替换：升级时暂停旧任务，替代任务完成后才删除旧任务；无完整副本时保护最后一个未完成任务，死种、免费期和自动删种均遵守保护。",
     "v1.1.21": "修复主标题相同但 RSS 副标题不同的条目被错误去重；副标题参与身份键，技术字段仍被忽略。",
     "v1.1.20": "修复部分 PT 站 RSS 新种全部漏下：支持从 HTML 描述和带单位的 length 字段解析体积，统一站点 GB 与规则容量换算，兼容对象型 enclosure、content/summary/subtitle 和描述内发布时间；qB 长期未确认的提交会解除链接记录并自动重试。",
