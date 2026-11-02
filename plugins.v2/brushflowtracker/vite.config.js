@@ -22,20 +22,14 @@ export default defineConfig({
     }),
   ],
   build: { target: 'esnext', minify: false, cssCodeSplit: true },
+  // Never filter by .v-/.mdi- selector names: they also occur in our scoped
+  // :deep overrides. Keep component CSS intact (Vuetify is shared by the host).
   css: {
     postcss: {
       plugins: [
         {
           postcssPlugin: 'internal:charset-removal',
           AtRule: { charset: atRule => atRule.remove() },
-        },
-        {
-          postcssPlugin: 'vuetify-filter',
-          Root(root) {
-            root.walkRules(rule => {
-              if (rule.selector && (rule.selector.includes('.v-') || rule.selector.includes('.mdi-'))) rule.remove()
-            })
-          },
         },
       ],
     },

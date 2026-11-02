@@ -135,7 +135,7 @@ def _canonical_series_title(text: str) -> str:
     """Extract and normalize the release's series name before technical metadata."""
     markers = []
     for pattern in (
-        r"(?<!\d)20\d{2}(?!\d)",
+        r"(?<!\d)(?:19|20)\d{2}(?!\d)",
         r"(?<![A-Z0-9])S\s*\d{1,3}(?!\d)",
         r"(?<!\d)(?:8K|4K|UHD|4320P|2160[PI]|1080[PI]|720P|576P|480P)(?!\d)",
     ):
@@ -167,26 +167,48 @@ def _chinese_series_alias(text: str) -> Optional[str]:
     return alias if len(alias) >= 2 else None
 
 
-def media_key(title: str, context: str = "", subtitle: str = "") -> str:
-    """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
+IDENTITY_VERSION = 2
+
+
+def media_identity(title: str, context: str = "", subtitle: str = "") -> Dict[str, Any]:
+    """Keep identity inputs separate from release quality and downloader names."""
     raw_text = unicodedata.normalize("NFKC", title or "")
-    context_text = unicodedata.normalize("NFKC", context or "")
-    subtitle_text = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", subtitle or "")).strip()
-    metadata_text = f"{context_text} {subtitle_text}".strip()
-    alias = _chinese_series_alias(metadata_text) if metadata_text else None
+    metadata = " ".join(re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", value or ""))
+                        for value in (context, subtitle)).strip()
+    alias = _chinese_series_alias(metadata) if metadata else None
     text = raw_text.upper()
-    combined = f"{raw_text} {metadata_text}".upper()
     series = _canonical_series_title(text)
-    season, episode_start, episode_end = _episode_identity(combined)
+    season, start, end = _episode_identity(f"{raw_text} {metadata}".upper())
+    # A year in free-expiry/publication prose is not a release year.
+    year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", text)
+    year = int(year_match.group(1)) if year_match else None
     if alias:
         season = season or 1
-        series = alias
-    identity = [series or re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip()]
-    if season is not None:
-        identity.append(f"S{season}")
-    if episode_start is not None:
-        identity.append(f"E{episode_start}-{episode_end}")
-    return hashlib.sha1("|".join(identity).encode("utf-8")).hexdigest()[:24]
+    return {
+        "title": series or re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip(),
+        "year": year,
+        "season": season,
+        "episode_start": start,
+        "episode_end": end,
+        "alias": alias,
+        "identity_version": IDENTITY_VERSION,
+    }
+
+
+def identity_key(identity: Dict[str, Any]) -> str:
+    """Hash only structural identity; a missing year never equals a known year."""
+    parts = [str(identity.get("alias") or identity.get("title") or "")]
+    for field, prefix in (("year", "Y"), ("season", "S")):
+        if identity.get(field) is not None:
+            parts.append(f"{prefix}{identity[field]}")
+    if identity.get("episode_start") is not None:
+        parts.append(f"E{identity['episode_start']}-{identity.get('episode_end') or identity['episode_start']}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def media_key(title: str, context: str = "", subtitle: str = "") -> str:
+    """生成包含年份和精确季集范围的跨画质稳定身份键。"""
+    return identity_key(media_identity(title, context, subtitle))
 
 
 def quality_rank(title: str, resolution_rank: Optional[int] = None) -> int:
@@ -257,16 +279,19 @@ def item_preference(item: Dict[str, Any]) -> Tuple[int, int]:
 def seed_availability(item: Dict[str, Any]) -> Optional[int]:
     """Read an RSS seed count when the site exposes one; None means unknown."""
     fields = list(_iter_fields(item))
-    names = {"seeders", "seeds", "seed", "numseeders", "seedercount", "complete"}
+    names = {"seeders", "seeds", "seed", "numseeders", "seedercount", "complete", "numseeds", "numcomplete"}
+    counts = []
     for key, value in fields:
         if key not in names:
             continue
         try:
-            number = int(float(str(value).strip()))
-        except (TypeError, ValueError):
+            number = float(str(value).strip())
+            if number >= 0 and number.is_integer():
+                counts.append(int(number))
+        except (TypeError, ValueError, OverflowError):
             continue
-        if number >= 0:
-            return number
+    if counts:
+        return max(counts)
     text = " ".join(str(value or "") for key, value in fields if key in {"title", "description", "summary"})
     match = re.search(r"(?:SEED(?:ER)?S?|做种|种子)\s*[:：]?\s*(\d+)", text, re.I)
     return int(match.group(1)) if match else None
@@ -285,10 +310,11 @@ def item_downloadability(item: Dict[str, Any]) -> int:
         return 1
 
 
-def item_preference_with_availability(item: Dict[str, Any]) -> Tuple[int, int, int]:
-    """Prefer downloadable releases, then quality, then larger size."""
+def item_preference_with_availability(item: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    """Only confirmed zero seeds may justify a quality downgrade, not missing data."""
     quality, size = item_preference(item)
-    return item_downloadability(item), quality, size
+    availability = item_downloadability(item)
+    return int(availability > 0), quality, availability, size
 
 
 def promotion_of(item: Dict[str, Any]) -> str:
@@ -385,6 +411,13 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
     size = int(_number(size_value, 0) or 0)
     if size <= 0:
         size = _size_from_text(str(size_value or "")) or _size_from_text(f"{title} {description}")
+    stored_identity = raw.get("identity")
+    identity = media_identity(title, description, subtitle_value)
+    if isinstance(stored_identity, dict):
+        # Upgrade the schema by filling gaps, never by overwriting known identity.
+        for field in identity:
+            if field != "identity_version" and stored_identity.get(field) not in (None, ""):
+                identity[field] = stored_identity[field]
     return {
         **raw,
         "title": title,
@@ -397,10 +430,10 @@ def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[
         "resolution_rank": rank,
         "quality_rank": quality_rank(title, rank),
         "subtitle": subtitle_value,
-        "media_key": media_key(title, description, subtitle_value),
-        "series_alias": _chinese_series_alias(
-            f"{title} {description}"
-        ),
+        "identity": identity,
+        "identity_version": IDENTITY_VERSION,
+        "media_key": identity_key(identity),
+        "series_alias": identity.get("alias"),
         "promotion": promotion,
         "promotion_known": promotion_known(raw) or bool(free_until),
         "free_until": free_until,
@@ -517,10 +550,10 @@ def first_cleanup_rule(
     ratio = float(_number(torrent.get("ratio"), 0) or 0)
     seeding_time = float(_number(torrent.get("seeding_time"), 0) or 0)
     for rule in rules:
-        if not rule.get("enabled", True):
+        if not rule.get("enabled", True) or rule.get("scope_error"):
             continue
         required_tags = set(split_terms(rule.get("labels")))
-        if required_tags and required_tags.isdisjoint(tags):
+        if rule.get("label_scope") != "all" and (not required_tags or required_tags.isdisjoint(tags)):
             continue
         if seeding_time < float(rule.get("min_seed_hours") or 0) * 3600:
             continue

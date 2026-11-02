@@ -1,11 +1,13 @@
 {
   "name": "moviepilot-brushflowtracker-plugin",
   "private": true,
-  "version": "1.1.23",
+  "version": "1.1.24",
+  "packageManager": "pnpm@9.15.9",
   "type": "module",
   "scripts": {
     "dev": "vite build --watch",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test src/utils/workbench.test.js src/components/Workbench.test.js"
   },
   "dependencies": {
     "vue": "^3.5.13",

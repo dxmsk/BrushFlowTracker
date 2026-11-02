@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import re
 import threading
 import time
@@ -32,9 +33,12 @@ from .core import (
     match_rule,
     normalize_item,
     parse_datetime,
+    seed_availability,
     split_terms,
 )
 from .models import DownloaderTestPayload, RunPayload, SettingsPayload
+from .persistence import CoalescingWriter
+from .snapshots import BatchTorrentView
 
 
 class _CustomQBAdapter:
@@ -120,7 +124,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.23"
+    plugin_version = "1.1.24"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -130,9 +134,31 @@ class BrushFlowTracker(_PluginBase):
     STATE_KEY = "runtime_state"
 
     def init_plugin(self, config: dict = None) -> None:
-        """读取配置、补齐稳定标识并恢复持久化运行状态。"""
+        """Publish configuration only between runs; never replace an active run's state."""
         raw_config = config or {}
         normalized = self._normalize_config(raw_config)
+        if not hasattr(self, "_job_guard"):
+            self._job_guard = threading.RLock()
+            self._running_jobs = {}
+            self._pending_config = None
+            self._config_revision = 0
+            self._active_config_revision = 0
+            self._state_writer = CoalescingWriter()
+            self._torrent_cache_generation = 0
+            self._published_state = {}
+        with self._job_guard:
+            if normalized != getattr(self, "_requested_config", None):
+                self._config_revision += 1
+            self._requested_config = copy.deepcopy(normalized)
+            if self._running_jobs:
+                self._pending_config = (copy.deepcopy(normalized), copy.deepcopy(raw_config))
+                if raw_config != normalized:
+                    self.update_config(normalized)
+                return
+            self._apply_config(normalized, raw_config)
+
+    def _apply_config(self, normalized: Dict[str, Any], raw_config: Dict[str, Any]) -> None:
+        """Caller owns _job_guard and has no active network worker."""
         self._enabled = normalized["enabled"]
         self._show_sidebar_nav = normalized["show_sidebar_nav"]
         self._downloader = normalized["downloader"]
@@ -150,13 +176,7 @@ class BrushFlowTracker(_PluginBase):
         self._sites = normalized["sites"]
         self._config = normalized
         self._site_auth_cache = {}
-        # Do not replace these guards during a settings reload: MoviePilot can
-        # still hold a bound method for a job that was submitted before reload.
-        if not hasattr(self, "_job_guard"):
-            self._job_guard = threading.Lock()
-            self._running_jobs: Dict[str, Dict[str, Any]] = {}
-        if not hasattr(self, "_state_save_lock"):
-            self._state_save_lock = threading.Lock()
+        # Locks and live state survive ordinary configuration saves.
         rss_rule_count = sum(len(site.get("rss_rules") or []) for site in self._sites)
         self._job_timeouts = {
             "rss": max(300, self._request_timeout_seconds * max(5, rss_rule_count)),
@@ -179,21 +199,27 @@ class BrushFlowTracker(_PluginBase):
         # Saving settings re-enters init_plugin on the same instance. Reuse the
         # in-memory runtime state instead of reading and rebuilding a large JSON
         # document on every save.
-        state = getattr(self, "_state", None) or self.get_data(self.STATE_KEY) or {}
-        self._state = {
-            "dedup_records": dict(state.get("dedup_records") or {}),
-            "processed_urls": dict(state.get("processed_urls") or {}),
-            "managed": dict(state.get("managed") or {}),
-            "pending_managed": list(state.get("pending_managed") or []),
-            "history": list(state.get("history") or []),
-            "site_stats": dict(state.get("site_stats") or {}),
-            "last_runs": dict(state.get("last_runs") or {}),
-            "dead_seed_urls": dict(state.get("dead_seed_urls") or {}),
-            "dead_seed_watch": dict(state.get("dead_seed_watch") or {}),
-            "dead_seed_fallbacks": dict(state.get("dead_seed_fallbacks") or {}),
-        }
+        if not hasattr(self, "_state"):
+            state = copy.deepcopy(self.get_data(self.STATE_KEY) or {})
+            self._state = {
+                "dedup_records": dict(state.get("dedup_records") or {}),
+                "processed_urls": dict(state.get("processed_urls") or {}),
+                "managed": dict(state.get("managed") or {}),
+                "pending_managed": list(state.get("pending_managed") or []),
+                "history": list(state.get("history") or []),
+                "site_stats": dict(state.get("site_stats") or {}),
+                "last_runs": dict(state.get("last_runs") or {}),
+                "dead_seed_urls": dict(state.get("dead_seed_urls") or {}),
+                "dead_seed_watch": dict(state.get("dead_seed_watch") or {}),
+                "dead_seed_fallbacks": dict(state.get("dead_seed_fallbacks") or {}),
+                "deleted_hashes": dict(state.get("deleted_hashes") or {}),
+            }
         if self._highest_resolution_dedup and self._migrate_managed_dedup_records():
-            self._save_state()
+            self._save_state_safely("migration")
+        self._active_config_revision = self._config_revision
+        self._pending_config = None
+        self._published_state = copy.deepcopy(self._state)
+        self._invalidate_torrent_cache()
         if raw_config != normalized:
             self.update_config(normalized)
 
@@ -282,27 +308,37 @@ class BrushFlowTracker(_PluginBase):
         include_downloaders: bool = True,
     ) -> schemas.Response:
         """返回全局配置、站点统计和指定站点的 qBittorrent 任务。"""
-        sites = [self._site_summary(site) for site in self._sites]
+        with self._job_guard:
+            config = copy.deepcopy(self._requested_config)
+            pending_config = self._pending_config is not None
+            revision = self._config_revision
+            active_revision = self._active_config_revision
+        state = self._state_view()
+        sites = [self._site_summary(site, state) for site in config["sites"]]
         selected_id = site_id or (sites[0]["id"] if sites else None)
-        selected = self._find_site(selected_id)
+        selected = next((site for site in config["sites"] if site["id"] == selected_id), None)
         tasks: List[Dict[str, Any]] = []
         downloader_error = None
         if selected and include_tasks:
             tasks, downloader_error = self._site_torrents(selected)
-            sites = [self._site_summary(site) for site in self._sites]
         return schemas.Response(
             success=True,
             data={
-                "settings": self._config,
+                "settings": config,
                 "sites": sites,
                 "selected_site": selected,
                 "tasks": tasks,
-                "history": [row for row in reversed(self._state["history"]) if not selected_id or row.get("site_id") == selected_id][:100],
+                "history": [row for row in reversed(state["history"]) if not selected_id or row.get("site_id") == selected_id][:100],
                 "downloaders": self._downloader_options() if include_downloaders else [],
                 "downloader_error": downloader_error,
-                "managed_count": len(self._state["managed"]),
-                "dedup_count": len(self._state["dedup_records"]),
+                "managed_count": len(state["managed"]),
+                "dedup_count": len(state["dedup_records"]),
                 "running_jobs": self._running_job_status(),
+                "last_runs": state["last_runs"],
+                "config_pending": pending_config,
+                "config_revision": revision,
+                "active_config_revision": active_revision,
+                "state_save_pending": self._state_writer.dirty,
             },
         )
 
@@ -326,8 +362,9 @@ class BrushFlowTracker(_PluginBase):
     def save_settings(self, payload: SettingsPayload) -> schemas.Response:
         """校验并保存全部全局与站点设置，同时重建宿主定时任务。"""
         config = self._normalize_config(payload.model_dump())
-        self.update_config(config)
-        self.init_plugin(config)
+        with self._job_guard:
+            self.update_config(config)
+            self.init_plugin(config)
         try:
             ThreadHelper().submit(self._refresh_scheduler)
         except Exception as err:
@@ -377,6 +414,11 @@ class BrushFlowTracker(_PluginBase):
             service, error = self._qb_service()
             if error:
                 raise RuntimeError(error)
+            # One baseline for the whole RSS batch, followed by one fresh
+            # confirmation query. No per-candidate full-queue polling or sleeps.
+            real_service = service
+            if hasattr(service.instance, "get_torrents"):
+                service = SimpleNamespace(instance=BatchTorrentView(service.instance))
             if self._highest_resolution_dedup:
                 summary["replaced"] += self._deduplicate_managed_torrents(service, site_id)
             else:
@@ -389,6 +431,11 @@ class BrushFlowTracker(_PluginBase):
                 site_results[site["id"]] = site_result
                 summary.update(site_result)
             summary.update(self._flush_pending_candidates(service))
+            if self._state.get("pending_managed") and hasattr(real_service.instance, "get_torrents"):
+                torrents, failed = real_service.instance.get_torrents()
+                if not failed:
+                    self._reconcile_pending_managed(real_service, torrents)
+            self._invalidate_torrent_cache()
             for site in target_sites:
                 self._update_site_rss_stats(site["id"], site_results.get(site["id"], Counter()))
             self._record_run("rss", site_id, started, dict(summary), None)
@@ -402,7 +449,7 @@ class BrushFlowTracker(_PluginBase):
             self._finish_job("rss", job_token)
 
     def monitor_free_expiry(self, site_id: Optional[str] = None) -> Dict[str, Any]:
-        """免费到期时删除尚未完成的托管任务及其未完成文件。"""
+        """免费到期先停止下载；没有完整副本时只暂停保留数据并尝试回退。"""
         job_token, elapsed = self._start_job("free_monitor", site_id)
         if not job_token:
             logger.info(f"刷流追新免费期监控仍在运行（{elapsed} 秒），本轮跳过")
@@ -432,15 +479,23 @@ class BrushFlowTracker(_PluginBase):
                 if not torrent:
                     continue
                 result["expired"] += 1
-                progress = float(torrent.get("progress") or 0)
-                amount_left = int(torrent.get("amount_left") or 0)
-                if progress >= 1 and amount_left <= 0:
+                if self._torrent_is_complete(torrent):
                     record["free_until"] = None
                     result["completed"] += 1
                     continue
+                record.update(self._identity_fields(self._managed_item(record, torrent)))
+                record["recovery_state"] = "free_expired"
+                was_paused = self._torrent_paused(torrent)
+                if self._pause_managed(service.instance, [torrent_hash], torrents, "free_expired"):
+                    result["paused"] += int(not was_paused and self._torrent_paused(torrent))
+                else:
+                    result["pause_failed"] += 1
+                self._rebuild_media_dedup(str(record.get("media_key") or ""), torrents)
                 if not self._has_completed_media_copy(record, torrents):
                     result["protected"] += 1
-                    logger.info(f"刷流追新免费到期保护未完成最后任务：{record.get('title')}")
+                    if self._restore_replacement(service, record, torrents) or self._activate_dead_seed_fallback(service, record):
+                        result["recovered"] += 1
+                    logger.info(f"刷流追新免费到期暂停保留最后副本：{record.get('title')}")
                     continue
                 if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
                     result["deleted"] += 1
@@ -458,8 +513,8 @@ class BrushFlowTracker(_PluginBase):
     def _monitor_dead_seeds(
         self, service: Any, torrents: List[Dict[str, Any]], site_id: Optional[str] = None
     ) -> int:
-        """Delete managed torrents that have no seeders and no progress for too long."""
-        if not self._avoid_dead_seeds or not hasattr(service.instance, "delete_torrents"):
+        """Recover stalled downloads even when deletion of the last copy is forbidden."""
+        if not self._avoid_dead_seeds:
             return 0
         now = datetime.now().astimezone()
         watch = self._state.setdefault("dead_seed_watch", {})
@@ -468,61 +523,65 @@ class BrushFlowTracker(_PluginBase):
         for torrent in torrents or []:
             torrent_hash = str(torrent.get("hash") or "").lower()
             record = self._state["managed"].get(torrent_hash)
-            if not torrent_hash or not record or (site_id and record.get("site_id") != site_id):
+            if not torrent_hash or not record:
                 continue
             active_hashes.add(torrent_hash)
+            if site_id and record.get("site_id") != site_id:
+                continue
+            record.update(self._identity_fields(self._managed_item(record, torrent)))
             progress = float(torrent.get("progress") or 0)
             speed = int(torrent.get("dlspeed") or 0)
-            if progress >= 1 or int(torrent.get("amount_left") or 0) <= 0:
+            if self._torrent_is_complete(torrent):
+                watch.pop(torrent_hash, None)
+                record["recovery_state"] = "complete"
+                self._commit_confirmed_dedup(torrent_hash, torrent)
+                continue
+            if record.get("recovery_state") == "free_expired":
+                continue
+            if self._torrent_paused(torrent) and record.get("pause_reason") != "dead_seed":
+                # Paused upgrades are backups, not stalled downloads; user pauses
+                # must never be taken over by the automatic recovery state machine.
                 watch.pop(torrent_hash, None)
                 continue
-            if not self._has_completed_media_copy(record, torrents):
-                logger.info(f"刷流追新保护未完成追新任务不删除：{record.get('title')} | 尚无完整副本")
-                continue
-            raw_seeds = torrent.get("num_seeds")
-            if raw_seeds is None:
-                raw_seeds = torrent.get("num_complete")
-            if raw_seeds is None:
-                watch.pop(torrent_hash, None)
-                continue
-            try:
-                seeds = int(raw_seeds)
-            except (TypeError, ValueError):
+            seeds = seed_availability({key: torrent.get(key) for key in ("num_seeds", "num_complete")})
+            if seeds is None:
                 watch.pop(torrent_hash, None)
                 continue
             if seeds >= self._dead_seed_min_seeders or speed > 0:
                 watch.pop(torrent_hash, None)
+                if not self._torrent_paused(torrent):
+                    record["recovery_state"] = "downloading"
                 continue
             entry = watch.setdefault(
                 torrent_hash,
                 {"since": isoformat(now), "progress": progress, "title": record.get("title")},
             )
+            if progress > float(entry.get("progress") or 0):
+                entry.update(since=isoformat(now), progress=progress)
+                continue
             since = parse_datetime(entry.get("since"), now) or now
             if (now - since).total_seconds() < self._dead_seed_wait_minutes * 60:
                 continue
-            if not service.instance.delete_torrents(
-                ids=[torrent_hash], delete_file=self._dead_seed_delete_files
-            ):
+            record["recovery_state"] = "stalled"
+            record["stalled_at"] = isoformat(now)
+            url = str(record.get("download_url") or record.get("link") or "").strip()
+            if url:
+                self._state.setdefault("dead_seed_urls", {})[hashlib.sha1(url.encode("utf-8")).hexdigest()] = isoformat(now)
+            key = str(record.get("media_key") or "")
+            self._rebuild_media_dedup(key, torrents)
+            if not self._has_completed_media_copy(record, torrents):
+                self._pause_managed(service.instance, [torrent_hash], torrents, "dead_seed")
+                if not self._restore_replacement(service, record, torrents):
+                    self._activate_dead_seed_fallback(service, record)
+                logger.info(f"刷流追新保留死种数据并尝试恢复/备用：{record.get('title')}")
+                continue
+            if not service.instance.delete_torrents(ids=[torrent_hash], delete_file=self._dead_seed_delete_files):
                 logger.warning(f"刷流追新死种删除失败：{record.get('title')}")
                 continue
             deleted += 1
-            url = str(record.get("link") or "").strip()
-            if url:
-                self._state.setdefault("dead_seed_urls", {})[
-                    hashlib.sha1(url.encode("utf-8")).hexdigest()
-                ] = isoformat(now)
-            key = self._site_media_key(
-                str(record.get("site_id") or ""),
-                self._managed_item(record, torrent),
-            )
-            current = self._state["dedup_records"].get(key)
-            if current and current.get("title") == record.get("title"):
-                self._state["dedup_records"].pop(key, None)
             watch.pop(torrent_hash, None)
-            self._archive_managed(torrent_hash, "持续无做种且无下载速度，判定死种后删除", site_id=record.get("site_id"))
-            logger.warning(f"刷流追新删除死种：{record.get('title')} | 等待={self._dead_seed_wait_minutes}分钟")
-            if self._activate_dead_seed_fallback(service, record):
-                logger.info(f"刷流追新已切换死种备用版本：{record.get('title')}")
+            self._archive_managed(torrent_hash, "已有完整副本，删除持续停滞的死种", site_id=record.get("site_id"))
+            self._rebuild_media_dedup(key, torrents)
         for torrent_hash in list(watch):
             if torrent_hash not in active_hashes:
                 watch.pop(torrent_hash, None)
@@ -632,6 +691,10 @@ class BrushFlowTracker(_PluginBase):
                     selected_urls = {item["enclosure"] for item in highest_candidates}
                     for item in candidates:
                         if item["enclosure"] not in selected_urls:
+                            self._save_fallback_candidate(str(item.get("media_key") or ""), {
+                                "site": site, "rule": rule, "item": item,
+                                "url_key": hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest(), "now": now,
+                            })
                             result["lower_resolution"] += 1
                             self._log_selection(site, rule, item, "排除", "同批已有更可下载或更高画质版本")
                     candidates = highest_candidates
@@ -660,15 +723,6 @@ class BrushFlowTracker(_PluginBase):
                         result["added"] += 1
                         self._log_selection(site, rule, item, "添加", "符合全部条件")
                         self._state["processed_urls"][url_key] = isoformat(now)
-                        if self._highest_resolution_dedup and not rule.get("resolutions"):
-                            self._state["dedup_records"][self._site_media_key(site["id"], item)] = {
-                                "title": item["title"],
-                                "resolution": item["resolution"],
-                                "resolution_rank": item["resolution_rank"],
-                                "quality_rank": item["quality_rank"],
-                                "size": item.get("size") or 0,
-                                "updated_at": isoformat(now),
-                            }
                     else:
                         result["add_failed"] += 1
                         self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
@@ -698,31 +752,93 @@ class BrushFlowTracker(_PluginBase):
         }
 
     def _migrate_managed_dedup_records(self) -> bool:
-        """Seed new identity keys from managed tasks without touching qB data."""
+        """Backfill reliable identity only; pending/ambiguous legacy data is not proof."""
         changed = False
-        records = list(self._state.get("managed", {}).values()) + list(
-            self._state.get("pending_managed", [])
-        )
-        for managed in records:
-            site_id = str(managed.get("site_id") or "").strip()
-            title = str(managed.get("title") or "").strip()
-            if not site_id or not title:
+        for managed in list(self._state.get("managed", {}).values()) + list(self._state.get("pending_managed", [])):
+            if not managed.get("title"):
                 continue
-            item = normalize_item({"title": title})
-            key = self._site_media_key(site_id, item)
-            candidate = {
-                "title": title,
-                "resolution": item["resolution"],
-                "resolution_rank": item["resolution_rank"],
-                "quality_rank": item["quality_rank"],
-                "size": managed.get("size") or item.get("size") or 0,
-                "updated_at": managed.get("added_at") or isoformat(datetime.now().astimezone()),
-            }
-            existing = self._state["dedup_records"].get(key)
-            if existing is None or self._selection_preference(candidate) > self._selection_preference(existing):
-                self._state["dedup_records"][key] = candidate
+            item = self._managed_item(managed)
+            fields = self._identity_fields(item)
+            if any(managed.get(key) != value for key, value in fields.items()):
+                managed.update(fields)
                 changed = True
+        # Old quality-only records may have been produced by an unconfirmed add.
+        # Keep them for diagnostics, but never trust them for destructive dedup.
+        for torrent_hash in self._state.get("managed", {}):
+            changed = self._commit_confirmed_dedup(torrent_hash) or changed
         return changed
+
+    def _commit_confirmed_dedup(self, torrent_hash: str, torrent: Optional[Dict[str, Any]] = None) -> bool:
+        """Commit a quality record only after a real managed hash is registered."""
+        record = self._state.get("managed", {}).get(str(torrent_hash).lower())
+        if not record:
+            return False
+        item = self._managed_item(record, torrent)
+        if item.get("identity_uncertain") or self._recovery_blocked(record):
+            return False
+        record.update(self._identity_fields(item))
+        key = self._site_media_key(str(record.get("site_id") or ""), item)
+        previous = self._state["dedup_records"].get(key) or {}
+        completed = self._torrent_is_complete(torrent)
+        candidate = {
+            **self._identity_fields(item), "title": item["title"], "confirmed": True,
+            "torrent_hash": str(torrent_hash).lower(), "add_token": record.get("add_token"),
+            "completed": completed, "updated_at": record.get("added_at"),
+        }
+        if previous.get("confirmed") and previous.get("identity_version") == 2:
+            if previous.get("completed"):
+                candidate["completed"] = True
+            if previous.get("torrent_hash") != torrent_hash and self._selection_preference(previous) > self._selection_preference(candidate):
+                if completed and not previous.get("completed"):
+                    previous["completed"] = True
+                    return True
+                return False
+        if previous == candidate:
+            return False
+        self._state["dedup_records"][key] = candidate
+        return True
+
+    def _rebuild_media_dedup(self, key: str, torrents: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Recompute one identity after failure, without erasing another successful add."""
+        current = self._state["dedup_records"].get(key) or {}
+        if current.get("completed") and current.get("confirmed"):
+            return
+        self._state["dedup_records"].pop(key, None)
+        torrent_map = {str(row.get("hash") or "").lower(): row for row in torrents or []}
+        for torrent_hash, record in self._state.get("managed", {}).items():
+            if self._managed_item(record).get("media_key") == key:
+                self._commit_confirmed_dedup(torrent_hash, torrent_map.get(torrent_hash))
+
+    def _on_managed_confirmed(self, service: Any, torrent_hash: str, torrents: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Reconcile hook: call AFTER assigning managed[hash], instead of a bare pause."""
+        self._state.setdefault("deleted_hashes", {}).pop(str(torrent_hash).lower(), None)
+        self._invalidate_torrent_cache()
+        record = self._state["managed"][str(torrent_hash).lower()]
+        torrent = next((row for row in torrents or []
+                        if str(row.get("hash") or "").lower() == str(torrent_hash).lower()), None)
+        record.update(self._identity_fields(self._managed_item(record, torrent)))
+        if record.get("recovery_state") in {None, "pending"}:
+            record["recovery_state"] = "complete" if self._torrent_is_complete(torrent) else "downloading"
+        old_hashes = record.pop("replace_hashes", None) or record.get("replacement_for") or []
+        old_hashes = [str(value).lower() for value in old_hashes if str(value).lower() != str(torrent_hash).lower()]
+        record["replacement_for"] = self._incomplete_replacement_hashes(old_hashes, torrents, record.get("title", ""))
+        record["replacement_for"] = [value for value in record["replacement_for"]
+                                     if self._same_media(record, self._state["managed"].get(value, {}))]
+        if not self._recovery_blocked(record) and not (torrent and self._torrent_paused(torrent)):
+            self._pause_managed(service.instance, record["replacement_for"], torrents or [], "upgrade", str(torrent_hash).lower())
+        self._commit_confirmed_dedup(str(torrent_hash).lower(), torrent)
+
+    def _on_pending_failed(self, service: Any, record: Dict[str, Any], torrents: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Reconcile hook: rollback this add token only, before removing its pending row."""
+        token = record.get("add_token")
+        url_key = record.get("url_key") or hashlib.sha1(str(record.get("download_url") or record.get("link") or "").encode()).hexdigest()
+        others = list(self._state.get("managed", {}).values()) + [row for row in self._state.get("pending_managed", [])
+                 if row is not record and (not token or row.get("add_token") != token)]
+        if not any(row.get("url_key") == url_key or (row.get("download_url") and
+                   hashlib.sha1(str(row["download_url"]).encode()).hexdigest() == url_key) for row in others):
+            self._state["processed_urls"].pop(url_key, None)
+        self._rebuild_media_dedup(str(record.get("media_key") or ""), torrents)
+        self._restore_replacement(service, record, torrents or [])
 
     @staticmethod
     def _site_media_key(_site_id: str, item: Dict[str, Any]) -> str:
@@ -731,9 +847,11 @@ class BrushFlowTracker(_PluginBase):
 
     def _site_dedup_allows(self, site_id: str, item: Dict[str, Any]) -> bool:
         record = self._state["dedup_records"].get(self._site_media_key(site_id, item))
-        if record and record.get("completed"):
+        if not record or not record.get("confirmed") or record.get("identity_version") != 2:
+            return True
+        if record.get("completed"):
             return False
-        return record is None or self._selection_preference(item) > self._selection_preference(record)
+        return self._selection_preference(item) > self._selection_preference(record)
 
     def _selection_preference(self, item: Dict[str, Any]) -> Tuple[int, ...]:
         if self._avoid_dead_seeds:
@@ -776,7 +894,7 @@ class BrushFlowTracker(_PluginBase):
             for key in (
                 "title", "enclosure", "link", "description", "size", "resolution",
                 "resolution_rank", "quality_rank", "media_key", "series_alias", "promotion",
-                "promotion_known", "seeders",
+                "promotion_known", "seeders", "subtitle", "identity", "identity_version", "identity_uncertain",
             )
         }
         stored_item["pubdate"] = isoformat(source_item.get("pubdate"))
@@ -792,71 +910,114 @@ class BrushFlowTracker(_PluginBase):
         fallback_state[key] = existing_rows[:10]
 
     def _activate_dead_seed_fallback(self, service: Any, record: Dict[str, Any]) -> bool:
-        """Add the best saved alternative without applying the original RSS age window again."""
+        """Use a saved eligible release without reapplying its expired RSS age window."""
         key = str(record.get("media_key") or "")
-        rows = list(self._state.get("dead_seed_fallbacks", {}).get(key) or [])
-        if not rows:
-            return False
-        dead_urls = set(self._state.get("dead_seed_urls", {}))
-        rows = [row for row in rows if row.get("url_key") not in dead_urls]
-        if not rows:
-            self._state["dead_seed_fallbacks"].pop(key, None)
-            return False
-        for row in rows:
-            row["item"] = normalize_item(row["item"], datetime.now().astimezone())
-        chosen = max(rows, key=lambda row: self._selection_preference(row["item"]))
-        remaining = [row for row in rows if row is not chosen]
-        if remaining:
-            self._state["dead_seed_fallbacks"][key] = remaining
-        else:
-            self._state["dead_seed_fallbacks"].pop(key, None)
-        if not self._add_item(chosen["site"], chosen["rule"], chosen["item"], service):
-            logger.warning(f"刷流追新死种备用版本添加失败：{chosen['item'].get('title')}")
-            return False
-        self._state["processed_urls"][chosen["url_key"]] = isoformat(datetime.now().astimezone())
-        self._state["dedup_records"][key] = {
-            "title": chosen["item"]["title"],
-            "resolution": chosen["item"]["resolution"],
-            "resolution_rank": chosen["item"]["resolution_rank"],
-            "quality_rank": chosen["item"]["quality_rank"],
-            "size": chosen["item"].get("size") or 0,
-            "updated_at": isoformat(datetime.now().astimezone()),
-        }
-        logger.info(f"刷流追新死种切换备用版本：{chosen['item'].get('title')}")
-        return True
+        rows = self._state.get("dead_seed_fallbacks", {}).get(key) or []
+        now = datetime.now().astimezone()
+        occupied = {str(row.get("download_url") or row.get("link") or "")
+                    for row in list(self._state["managed"].values()) + list(self._state["pending_managed"])}
+        for row in sorted(rows, key=lambda value: self._selection_preference(value["item"]), reverse=True):
+            item = normalize_item(row["item"], now)
+            if row.get("url_key") in self._state.get("dead_seed_urls", {}) or item.get("enclosure") in occupied:
+                continue
+            if not self._same_media(record, item) or (item.get("free_until") and item["free_until"] <= now):
+                continue
+            site = next((site for site in self._sites if site.get("id") == row["site"].get("id")), None)
+            if self._sites and not site:
+                continue
+            rule = next((rule for rule in (site or {}).get("rss_rules", []) if rule.get("id") == row["rule"].get("id")), None)
+            if site and (not site.get("enabled", True) or not rule or not rule.get("enabled", True)):
+                continue
+            if not self._add_item(site or row["site"], rule or row["rule"], item, service):
+                logger.warning(f"刷流追新死种备用版本添加失败，保留候选重试：{item.get('title')}")
+                return False
+            self._state["processed_urls"][row["url_key"]] = isoformat(now)
+            self._state["dead_seed_fallbacks"][key] = [value for value in rows if value is not row]
+            logger.info(f"刷流追新死种切换备用版本：{item.get('title')}")
+            return True
+        return False
 
     def _managed_item(self, record: Dict[str, Any], torrent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """RSS identity is authoritative; a qB rename supplies only live statistics."""
         torrent = torrent or {}
-        title = str(torrent.get("name") or record.get("title") or "").strip()
-        context = str(record.get("description") or record.get("series_alias") or "")
-        size = int(torrent.get("size") or torrent.get("total_size") or record.get("size") or 0)
-        return normalize_item({"title": title, "description": context, "size": size})
+        source = dict(record)
+        source["title"] = str(record.get("title") or torrent.get("name") or "").strip()
+        source["size"] = torrent.get("size") or torrent.get("total_size") or record.get("size") or 0
+        live_seeds = seed_availability({key: torrent.get(key) for key in ("num_seeds", "num_complete")})
+        if live_seeds is not None:
+            source["seeders"] = live_seeds
+        item = normalize_item(source)
+        for key in ("quality_rank", "resolution_rank", "resolution"):
+            if record.get(key) is not None:
+                item[key] = record[key]
+        if not isinstance(record.get("identity"), dict):
+            # Season-only legacy titles may have lost the episode stored in subtitle.
+            identity = item["identity"]
+            certain = bool(identity.get("episode_start") is not None or (
+                identity.get("year") is not None and identity.get("season") is None
+            )) and not record.get("recovered")
+            item["identity_uncertain"] = not certain
+        else:
+            item["identity_uncertain"] = bool(record.get("identity_uncertain"))
+        if item["identity_uncertain"] and record.get("media_key"):
+            # A second migration/reload must not silently re-key ambiguous data.
+            item["media_key"] = record["media_key"]
+        return item
+
+    @staticmethod
+    def _identity_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: copy.deepcopy(item.get(key)) for key in (
+            "identity", "identity_version", "identity_uncertain", "media_key", "subtitle",
+            "description", "series_alias", "resolution", "resolution_rank", "quality_rank", "size", "seeders",
+        )}
+
+    def _same_media(self, left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+        left_item, right_item = self._managed_item(left), self._managed_item(right)
+        return bool(not left_item.get("identity_uncertain") and not right_item.get("identity_uncertain")
+                    and left_item.get("media_key") and left_item["media_key"] == right_item.get("media_key"))
+
+    @staticmethod
+    def _recovery_blocked(record: Dict[str, Any]) -> bool:
+        deadline = parse_datetime(record.get("free_until"))
+        return bool(record.get("recovery_state") in {"stalled", "free_expired"}
+                    or (deadline and deadline <= datetime.now().astimezone()))
 
     def _inferior_managed_hashes(self, _site_id: str, item: Dict[str, Any]) -> List[str]:
-        """Find strictly worse managed tasks across every configured site."""
-        candidate_key = str(item.get("media_key") or "")
+        """Only confidently identified copies may participate in replacement."""
         inferior = []
         for torrent_hash, record in self._state.get("managed", {}).items():
             current = self._managed_item(record)
-            if current["media_key"] != candidate_key:
+            if not self._same_media(item, current):
                 continue
-            if self._selection_preference(item) > self._selection_preference(current):
+            if self._recovery_blocked(record) or self._selection_preference(item) > self._selection_preference(current):
                 inferior.append(str(torrent_hash).lower())
         return inferior
 
     @staticmethod
     def _torrent_is_complete(torrent: Optional[Dict[str, Any]]) -> bool:
-        """Use qB progress/remaining bytes to identify a safely completed task."""
+        """Authorize data removal only with non-contradictory proof of completion."""
         if not torrent:
             return False
+        state = str(torrent.get("state") or "").casefold()
+        if state in {"metadl", "forcedmetadl", "checkingdl", "checkingup", "checkingresumedata", "allocating", "missingfiles", "error", "unknown"}:
+            return False
         try:
-            if torrent.get("progress") is not None and float(torrent.get("progress")) >= 0.999999:
-                return True
-        except (TypeError, ValueError):
-            pass
-        try:
-            return torrent.get("amount_left") is not None and int(torrent.get("amount_left")) <= 0
-        except (TypeError, ValueError):
+            progress = float(torrent["progress"]) if torrent.get("progress") is not None else None
+            left = float(torrent["amount_left"]) if torrent.get("amount_left") is not None else None
+            size_value = torrent.get("total_size") if torrent.get("total_size") is not None else torrent.get("size")
+            size = float(size_value) if size_value is not None else None
+            if any(value is not None and not math.isfinite(value) for value in (progress, left, size)):
+                return False
+            if left is not None and left != 0:
+                return False
+            if progress is not None and progress != 1:
+                return False
+            if size is None or size <= 0:
+                return False
+            # A missing/zero size cannot prove that metadata or files exist.
+            upload_state = state in {"uploading", "stalledup", "forcedup", "pausedup", "queuedup", "stoppedup"}
+            return bool(progress == 1 or (left == 0 and upload_state))
+        except (TypeError, ValueError, OverflowError):
             return False
 
     @staticmethod
@@ -875,6 +1036,81 @@ class BrushFlowTracker(_PluginBase):
                 return True
         except Exception as err:
             logger.warning(f"刷流追新暂停旧版本失败：{err}")
+        return False
+
+    @staticmethod
+    def _torrent_paused(torrent: Dict[str, Any]) -> bool:
+        return str(torrent.get("state") or "").casefold().startswith(("paused", "stopped"))
+
+    def _pause_managed(self, instance: Any, hashes: List[str], torrents: List[Dict[str, Any]], reason: str, owner: str = "") -> bool:
+        """Record pause ownership only for pauses made by this plugin."""
+        torrent_map = {str(row.get("hash") or "").lower(): row for row in torrents}
+        success = True
+        for torrent_hash in hashes:
+            record = self._state["managed"].get(torrent_hash)
+            torrent = torrent_map.get(torrent_hash)
+            if not record or not torrent or self._torrent_is_complete(torrent):
+                continue
+            if self._torrent_paused(torrent) and not record.get("paused_by_plugin"):
+                continue
+            if not self._torrent_paused(torrent) and not self._pause_torrents(instance, [torrent_hash]):
+                success = False
+                continue
+            record.update(paused_by_plugin=True, pause_reason=reason, paused_for=owner)
+            torrent["state"] = "pausedDL"
+        return success
+
+    def _resume_managed(self, instance: Any, torrent_hash: str, torrent: Dict[str, Any]) -> bool:
+        record = self._state["managed"].get(torrent_hash) or {}
+        if not record.get("paused_by_plugin") or record.get("pause_reason") != "upgrade" or self._recovery_blocked(record):
+            return False
+        try:
+            method = getattr(instance, "resume_torrents", None)
+            if callable(method):
+                success = bool(method(ids=[torrent_hash]))
+            else:
+                method = getattr(getattr(instance, "client", None), "torrents_resume", None)
+                if not callable(method):
+                    return False
+                method(torrent_hashes=[torrent_hash])
+                success = True
+            if not success:
+                return False
+            record.update(paused_by_plugin=False, recovery_state="downloading")
+            record.pop("pause_reason", None)
+            record.pop("paused_for", None)
+            torrent["state"] = "downloading"
+            return True
+        except Exception as err:
+            logger.warning(f"刷流追新恢复旧版本失败：{err}")
+            return False
+
+    def _restore_replacement(self, service: Any, record: Dict[str, Any], torrents: List[Dict[str, Any]]) -> bool:
+        """Resume a viable plugin-owned backup, never a user's paused/free-expired task."""
+        torrent_map = {str(row.get("hash") or "").lower(): row for row in torrents}
+        choices = []
+        for torrent_hash, other in self._state.get("managed", {}).items():
+            torrent = torrent_map.get(torrent_hash)
+            if other is record or not torrent or not self._same_media(record, other) or self._recovery_blocked(other):
+                continue
+            if self._torrent_is_complete(torrent):
+                return True
+            item = self._managed_item(other, torrent)
+            if item.get("seeders") == 0:
+                continue
+            if self._torrent_paused(torrent):
+                if not other.get("paused_by_plugin") or other.get("pause_reason") != "upgrade":
+                    continue
+            else:
+                return True
+            choices.append((torrent_hash, other, torrent, item))
+        choices.sort(key=lambda row: self._selection_preference(row[3]), reverse=True)
+        for torrent_hash, other, torrent, _item in choices:
+            if self._resume_managed(service.instance, torrent_hash, torrent):
+                failed_hashes = [value for value, entry in self._state["managed"].items() if entry is record]
+                other["replacement_for"] = list(dict.fromkeys((other.get("replacement_for") or []) + failed_hashes))
+                self._rebuild_media_dedup(str(record.get("media_key") or ""), torrents)
+                return True
         return False
 
     @staticmethod
@@ -914,34 +1150,51 @@ class BrushFlowTracker(_PluginBase):
         return deletable
 
     def _has_completed_media_copy(self, record: Dict[str, Any], torrents: List[Dict[str, Any]]) -> bool:
-        key = str(record.get("media_key") or "")
-        if not key:
+        if self._managed_item(record).get("identity_uncertain"):
             return False
         torrent_map = {str(t.get("hash") or "").lower(): t for t in torrents or []}
         return any(
-            str(other.get("media_key") or "") == key and self._torrent_is_complete(torrent_map.get(str(h).lower()))
+            self._same_media(record, other) and self._torrent_is_complete(torrent_map.get(str(h).lower()))
             for h, other in self._state.get("managed", {}).items()
         )
 
     def _finalize_replacements(self, service: Any, torrents: List[Dict[str, Any]]) -> int:
-        """Delete paused inferior tasks only after their replacement is complete."""
+        """Finalize each old hash independently; failures retain their retry relation."""
         torrent_map = {str(t.get("hash") or "").lower(): t for t in torrents or []}
         deleted = 0
-        handled = set()
         for new_hash, record in list(self._state.get("managed", {}).items()):
-            old_hashes = [str(value).lower() for value in (record.get("replacement_for") or [])]
-            if not old_hashes or new_hash in handled:
+            old_hashes = list(dict.fromkeys(str(value).lower() for value in record.get("replacement_for") or []))
+            if not old_hashes or not self._torrent_is_complete(torrent_map.get(str(new_hash).lower())):
                 continue
-            if not self._torrent_is_complete(torrent_map.get(str(new_hash).lower())):
-                continue
-            deletable = [h for h in old_hashes if h in torrent_map and not self._torrent_is_complete(torrent_map[h])]
-            if deletable and service.instance.delete_torrents(ids=deletable, delete_file=True):
-                deleted += len(deletable)
-                for old_hash in deletable:
-                    self._archive_managed(old_hash, f"替代任务已完成，清理旧版本：{record.get('title')}")
-                logger.info(f"刷流追新替代任务已完成，删除旧版本：{record.get('title')}")
-            record.pop("replacement_for", None)
-            handled.add(new_hash)
+            self._commit_confirmed_dedup(new_hash, torrent_map[new_hash])
+            remaining = []
+            for old_hash in old_hashes:
+                if old_hash == new_hash:
+                    continue
+                torrent = torrent_map.get(old_hash)
+                if not torrent or self._torrent_is_complete(torrent):
+                    continue
+                old = self._state["managed"].get(old_hash)
+                if not old or not self._same_media(record, old):
+                    remaining.append(old_hash)
+                    continue
+                try:
+                    success = service.instance.delete_torrents(ids=[old_hash], delete_file=True)
+                except Exception as err:
+                    logger.warning(f"刷流追新替换删旧失败，保留重试关系：{err}")
+                    success = False
+                if not success:
+                    remaining.append(old_hash)
+                    continue
+                deleted += 1
+                torrent_map.pop(old_hash, None)
+                self._archive_managed(old_hash, f"替代任务已完成，清理旧版本：{record.get('title')}")
+            if remaining:
+                record["replacement_for"] = remaining
+                record["replacement_delete_attempts"] = int(record.get("replacement_delete_attempts") or 0) + 1
+            else:
+                record.pop("replacement_for", None)
+                record.pop("replacement_delete_attempts", None)
         return deleted
 
     def _deduplicate_managed_torrents(self, service: Any, _site_id: Optional[str] = None) -> int:
@@ -965,22 +1218,21 @@ class BrushFlowTracker(_PluginBase):
             if not torrent:
                 continue
             item = self._managed_item(record, torrent)
-            record.update({
-                "title": item["title"],
-                "resolution": item["resolution"],
-                "resolution_rank": item["resolution_rank"],
-                "quality_rank": item["quality_rank"],
-                "media_key": item["media_key"],
-                "size": item["size"],
-            })
+            record.update(self._identity_fields(item))
+            if item.get("identity_uncertain"):
+                continue
             key = self._site_media_key(str(record.get("site_id") or ""), item)
             groups.setdefault(key, []).append((str(torrent_hash).lower(), record, torrent))
 
         deleted = 0
         for key, rows in groups.items():
             has_completed = self._has_completed_in_group(rows)
+            eligible = [row for row in rows if self._torrent_is_complete(row[2]) or not self._recovery_blocked(row[1])]
+            if not eligible:
+                self._rebuild_media_dedup(key, torrents)
+                continue
             winner = max(
-                rows,
+                eligible,
                 key=lambda row: (
                     self._selection_preference(self._managed_item(row[1], row[2])),
                     float(row[2].get("progress") or 0),
@@ -988,15 +1240,15 @@ class BrushFlowTracker(_PluginBase):
                 ),
             )
             winner_item = self._managed_item(winner[1], winner[2])
-            self._state["dedup_records"][key] = {
-                "title": winner_item["title"],
-                "resolution": winner_item["resolution"],
-                "resolution_rank": winner_item["resolution_rank"],
-                "quality_rank": winner_item["quality_rank"],
-                "size": winner_item["size"],
-                "completed": has_completed,
-                "updated_at": isoformat(datetime.now().astimezone()),
-            }
+            self._state["dedup_records"].pop(key, None)
+            self._commit_confirmed_dedup(winner[0], winner[2])
+            if has_completed and key in self._state["dedup_records"]:
+                self._state["dedup_records"][key]["completed"] = True
+            # Resume the selected backup BEFORE pausing other copies. A failed
+            # resume or user pause must not leave every incomplete copy paused.
+            can_pause_others = not self._torrent_paused(winner[2])
+            if not has_completed and not can_pause_others:
+                can_pause_others = self._resume_managed(service.instance, winner[0], winner[2])
             for torrent_hash, record, torrent in rows:
                 if torrent_hash == winner[0]:
                     continue
@@ -1006,10 +1258,10 @@ class BrushFlowTracker(_PluginBase):
                     )
                     continue
                 if not has_completed:
-                    self._pause_torrents(service.instance, [torrent_hash])
-                    logger.info(
-                        f"刷流追新保护资源最后一个未完成任务：{record.get('title')} | 尚无完整副本"
-                    )
+                    if can_pause_others:
+                        reason = "dead_seed" if self._recovery_blocked(record) else "upgrade"
+                        self._pause_managed(service.instance, [torrent_hash], torrents, reason, winner[0])
+                        winner[1]["replacement_for"] = list(dict.fromkeys((winner[1].get("replacement_for") or []) + [torrent_hash]))
                     continue
                 if service.instance.delete_torrents(ids=[torrent_hash], delete_file=True):
                     deleted += 1
@@ -1059,15 +1311,6 @@ class BrushFlowTracker(_PluginBase):
                 record.get("site_result", Counter())["added"] += 1
                 self._log_selection(site, rule, item, "添加", "符合全部条件且为所有站点全局最佳版本")
                 self._state["processed_urls"][record["url_key"]] = isoformat(record["now"])
-                if self._highest_resolution_dedup:
-                    self._state["dedup_records"][self._site_media_key(site["id"], item)] = {
-                        "title": item["title"],
-                        "resolution": item["resolution"],
-                        "resolution_rank": item["resolution_rank"],
-                        "quality_rank": item["quality_rank"],
-                        "size": item.get("size") or 0,
-                        "updated_at": isoformat(record["now"]),
-                    }
             else:
                 result["add_failed"] += 1
                 record.get("site_result", Counter())["add_failed"] += 1
@@ -1222,13 +1465,9 @@ class BrushFlowTracker(_PluginBase):
         return BrushFlowTracker._append_site_auth(url, site, include_rss_key=True)
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
+        item = normalize_item(item)
         task_name = str(rule.get("name") or "RSS 任务").strip()
         tags = [task_name]
-        inferior_hashes = (
-            self._inferior_managed_hashes(site["id"], item)
-            if self._highest_resolution_dedup
-            else []
-        )
         existing_hashes: Optional[set] = None
         before_add: Optional[List[Dict[str, Any]]] = None
         if hasattr(service.instance, "get_torrents"):
@@ -1245,6 +1484,11 @@ class BrushFlowTracker(_PluginBase):
             except Exception as error:
                 before_add = None
                 logger.warning(f"刷流追新添加前读取 qB 任务快照失败：{error}")
+        for torrent in before_add or []:
+            record = self._state["managed"].get(str(torrent.get("hash") or "").lower())
+            if record:
+                record.update(self._identity_fields(self._managed_item(record, torrent)))
+        inferior_hashes = self._inferior_managed_hashes(site["id"], item) if self._highest_resolution_dedup else []
         success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
             return False
@@ -1256,6 +1500,11 @@ class BrushFlowTracker(_PluginBase):
         now = datetime.now().astimezone()
         identity = normalize_item(item, now)
         record = {
+            **self._identity_fields(identity),
+            "identity_uncertain": bool(identity.get("identity_uncertain")),
+            "add_token": uuid.uuid4().hex,
+            "download_url": item["enclosure"],
+            "recovery_state": "downloading" if hashes else "pending",
             "site_id": site["id"],
             "site_name": site["name"],
             "rule_id": rule["id"],
@@ -1279,14 +1528,12 @@ class BrushFlowTracker(_PluginBase):
             before_add,
             item["title"],
         )
-        if replace_hashes:
-            # Keep the old candidate as a recovery path until the new one is complete.
-            self._pause_torrents(service.instance, replace_hashes)
         for torrent_hash in hashes:
-            managed_record = dict(record)
+            managed_record = copy.deepcopy(record)
             if replace_hashes:
                 managed_record["replacement_for"] = list(replace_hashes)
             self._state["managed"][torrent_hash] = managed_record
+            self._on_managed_confirmed(service, torrent_hash, before_add)
         if not hashes:
             self._state["pending_managed"].append({
                 **record,
@@ -1296,8 +1543,8 @@ class BrushFlowTracker(_PluginBase):
                 "replace_hashes": replace_hashes,
             })
         self._append_history({**record, "event": "added", "torrent_hashes": hashes})
-        if replace_hashes:
-            logger.info(f"刷流追新已暂停旧版本，等待新版本完成后再删除：{item['title']}")
+        if replace_hashes and hashes:
+            logger.info(f"刷流追新已登记升级关系，等待新版本完成后再删除：{item['title']}")
         if item["promotion"] != "normal" and not item.get("free_until"):
             logger.warning(f"刷流追新已添加免费种但无法识别截止时间：{item['title']}")
         logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
@@ -1418,30 +1665,25 @@ class BrushFlowTracker(_PluginBase):
         title: str,
         existing_hashes: Optional[set] = None,
     ) -> List[str]:
-        # 不依赖 qB 的 tag 过滤参数（旧版 MoviePilot/qB 对 tags 参数支持不一致），
-        # 先取全部任务，再按本插件设置的任务标签和名称匹配。
-        for _attempt in range(3):
-            torrents, failed = service.instance.get_torrents()
-            if not failed:
-                matches = []
-                for item in torrents or []:
-                    torrent_hash = str(item.get("hash") or "").lower()
-                    if not torrent_hash or (
-                        existing_hashes is not None and torrent_hash in existing_hashes
-                    ):
-                        continue
-                    tags = set(split_terms(item.get("tags")))
-                    name = str(item.get("name") or "").strip()
-                    if task_name not in tags:
-                        continue
-                    if name == title.strip() or title.strip() in name or name in title.strip():
-                        matches.append(item)
-                matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
-                if matches:
-                    return [str(matches[0].get("hash") or "").lower()]
-            if _attempt < 2:
-                time.sleep(0.4)
-        return []
+        if isinstance(service.instance, BatchTorrentView):
+            return []  # One real refresh after the whole batch handles pending rows.
+        if not hasattr(service.instance, "get_torrents"):
+            return []
+        torrents, failed = service.instance.get_torrents()
+        if failed:
+            return []
+        matches = []
+        for item in torrents or []:
+            torrent_hash = str(item.get("hash") or "").lower()
+            if not torrent_hash or (existing_hashes is not None and torrent_hash in existing_hashes):
+                continue
+            tags = set(split_terms(item.get("tags")))
+            name = str(item.get("name") or "").strip()
+            if task_name in tags and name and title.strip() and (
+                    name == title.strip() or title.strip() in name or name in title.strip()):
+                matches.append(item)
+        matches.sort(key=lambda item: int(item.get("added_on") or 0), reverse=True)
+        return [str(matches[0].get("hash") or "").lower()] if matches else []
 
     def _site_torrents(
         self, site: Dict[str, Any], force: bool = False
@@ -1452,15 +1694,23 @@ class BrushFlowTracker(_PluginBase):
         torrents, failed = self._ui_torrents(service, force=force)
         if failed:
             return [], "读取 qBittorrent 任务失败"
-        self._reconcile_pending_managed(service, torrents)
-        self._recover_managed_by_tags(torrents)
+        # HTTP GET is a view operation: confirmations and recovery run only in
+        # background jobs, using fresh downloader observations.
+        state = self._state_view()
         site_labels = {str(rule.get("name") or "").strip() for rule in site.get("rss_rules") or []}
         site_labels.discard("")
+        other_labels = {
+            str(rule.get("name") or "").strip()
+            for other in self._sites if other["id"] != site["id"]
+            for rule in other.get("rss_rules") or []
+        }
+        site_labels -= other_labels
         managed_hashes = {
             torrent_hash
-            for torrent_hash, record in self._state["managed"].items()
+            for torrent_hash, record in state["managed"].items()
             if record.get("site_id") == site["id"]
         }
+        tombstones = state.get("deleted_hashes", {})
         return [
             {
                 "hash": item.get("hash"),
@@ -1476,42 +1726,44 @@ class BrushFlowTracker(_PluginBase):
                 "num_complete": item.get("num_complete"),
                 "num_incomplete": item.get("num_incomplete"),
                 "tags": split_terms(item.get("tags")),
-                "free_until": (self._state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("free_until"),
+                "free_until": (state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("free_until"),
+                "paused_by_plugin": (state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("paused_by_plugin", False),
+                "pause_reason": (state["managed"].get(str(item.get("hash") or "").lower()) or {}).get("pause_reason"),
             }
             for item in torrents or []
-            if str(item.get("hash") or "").lower() in managed_hashes
-            or bool(site_labels.intersection(split_terms(item.get("tags"))))
+            if str(item.get("hash") or "").lower() not in tombstones
+            and (str(item.get("hash") or "").lower() in managed_hashes
+                 or bool(site_labels.intersection(split_terms(item.get("tags")))))
         ], None
 
+    def _invalidate_torrent_cache(self) -> None:
+        with self._torrent_cache_lock:
+            self._torrent_cache_generation += 1
+            self._torrent_cache = {
+                "signature": None, "loaded_monotonic": 0.0, "torrents": [], "failed": True,
+            }
+
     def _ui_torrents(self, service: Any, force: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
-        """Reuse one short-lived qB snapshot while loading/switching site pages."""
-        signature = (
-            self._downloader_mode,
-            self._downloader,
-            self._config.get("custom_qb_url"),
-            self._config.get("custom_qb_host"),
-            self._config.get("custom_qb_port"),
-            self._config.get("custom_qb_username"),
-        )
+        """Cache views only; an older in-flight read cannot overwrite invalidation."""
+        signature = (id(service.instance), self._downloader_mode, self._downloader)
         now = time.monotonic()
         with self._torrent_cache_lock:
+            generation = self._torrent_cache_generation
             cached = self._torrent_cache
-            if (
-                not force
-                and cached.get("signature") == signature
-                and not cached.get("failed")
-                and now - float(cached.get("loaded_monotonic") or 0) < 8
-            ):
-                return list(cached.get("torrents") or []), False
+            if (not force and cached.get("signature") == signature
+                    and not cached.get("failed")
+                    and now - float(cached.get("loaded_monotonic") or 0) < 8):
+                return copy.deepcopy(cached.get("torrents") or []), False
         torrents, failed = service.instance.get_torrents()
         if not failed:
             with self._torrent_cache_lock:
-                self._torrent_cache = {
-                    "signature": signature,
-                    "loaded_monotonic": time.monotonic(),
-                    "torrents": list(torrents or []),
-                    "failed": False,
-                }
+                if generation == self._torrent_cache_generation:
+                    self._torrent_cache = {
+                        "signature": signature,
+                        "loaded_monotonic": time.monotonic(),
+                        "torrents": copy.deepcopy(torrents or []),
+                        "failed": False,
+                    }
         return list(torrents or []), bool(failed)
 
     def _recover_managed_by_tags(self, torrents: List[Dict[str, Any]]) -> None:
@@ -1525,7 +1777,8 @@ class BrushFlowTracker(_PluginBase):
         changed = False
         for torrent in torrents or []:
             torrent_hash = str(torrent.get("hash") or "").lower()
-            if not torrent_hash or torrent_hash in self._state["managed"]:
+            if (not torrent_hash or torrent_hash in self._state["managed"]
+                    or torrent_hash in self._state.get("deleted_hashes", {})):
                 continue
             matches = []
             for tag in split_terms(torrent.get("tags")):
@@ -1550,23 +1803,26 @@ class BrushFlowTracker(_PluginBase):
             changed = True
         if changed:
             self._migrate_managed_dedup_records()
-            try:
-                ThreadHelper().submit(self._save_state_safely, "task_recovery")
-            except Exception as err:
-                logger.warning(f"刷流追新提交托管任务状态保存失败：{err}")
+            # A running worker persists once at its transaction boundary; do
+            # not launch a snapshot writer while it is still changing state.
+            if not self._running_jobs:
+                self._save_state_safely("task_recovery")
 
     def _reconcile_pending_managed(
         self, service: Any, torrents: Optional[List[Dict[str, Any]]] = None
     ) -> None:
-        """补登记 qB 添加接口未立即返回 hash 的插件任务。"""
-        pending = list(self._state.get("pending_managed") or [])
-        if not pending:
+        """Reconcile fresh background observations; merge by identity, never overwrite new rows."""
+        if not self._state.get("pending_managed"):
             return
         if torrents is None:
             torrents, failed = service.instance.get_torrents()
             if failed:
                 return
-        remaining = []
+        with self._job_guard:
+            pending = list(self._state.get("pending_managed") or [])
+        resolved_ids = set()
+        claimed = set(self._state.get("managed", {}))
+        now = datetime.now().astimezone()
         for record in pending:
             task_name = str(record.get("rule_name") or "").strip()
             title = str(record.get("title") or "").strip()
@@ -1576,57 +1832,53 @@ class BrushFlowTracker(_PluginBase):
             matched_hash = None
             for item in torrents or []:
                 torrent_hash = str(item.get("hash") or "").lower()
-                if not torrent_hash or torrent_hash in existing_hashes:
+                if not torrent_hash or torrent_hash in existing_hashes or torrent_hash in claimed:
                     continue
                 tags = set(split_terms(item.get("tags")))
                 name = str(item.get("name") or "").strip()
-                if task_name in tags and title and (name == title or title in name or name in title):
+                if task_name in tags and title and name and (name == title or title in name or name in title):
                     matched_hash = torrent_hash
                     if matched_hash:
                         break
             if matched_hash:
                 managed_record = dict(record)
-                replace_hashes = [
-                    str(value).lower()
-                    for value in managed_record.pop("replace_hashes", []) or []
-                    if value and str(value).lower() != matched_hash
-                ]
-                replace_hashes = self._incomplete_replacement_hashes(
-                    replace_hashes, torrents, title
-                )
-                managed_record.pop("existing_hashes", None)
-                managed_record.pop("url_key", None)
-                managed_record.pop("confirm_attempts", None)
-                if replace_hashes:
-                    managed_record["replacement_for"] = list(replace_hashes)
+                for key in ("existing_hashes", "confirm_attempts", "last_confirm_at"):
+                    managed_record.pop(key, None)
                 self._state["managed"][matched_hash] = managed_record
-                if replace_hashes:
-                    self._pause_torrents(service.instance, replace_hashes)
-                    logger.info(f"刷流追新新任务已确认，旧版本已暂停，等待新版本完成：{title}")
+                self._state.setdefault("deleted_hashes", {}).pop(matched_hash, None)
+                claimed.add(matched_hash)
+                resolved_ids.add(id(record))
+                hook = getattr(self, "_on_managed_confirmed", None)
+                if hook:
+                    hook(service, matched_hash, torrents)
+                self._invalidate_torrent_cache()
             else:
-                attempts = int(record.get("confirm_attempts") or 0) + 1
-                added_at = parse_datetime(record.get("added_at"), datetime.now().astimezone())
-                age_seconds = (
-                    (datetime.now().astimezone() - added_at).total_seconds()
-                    if added_at else 0
-                )
-                if attempts >= 3 or age_seconds >= 300:
-                    url_key = str(record.get("url_key") or "").strip()
-                    if not url_key and record.get("link"):
-                        url_key = hashlib.sha1(str(record["link"]).encode("utf-8")).hexdigest()
-                    if url_key:
-                        self._state["processed_urls"].pop(url_key, None)
+                added_at = parse_datetime(record.get("added_at"), now)
+                age_seconds = max(0, (now - added_at).total_seconds()) if added_at else 0
+                last_check = parse_datetime(record.get("last_confirm_at"), now)
+                if last_check is None or (now - last_check).total_seconds() >= 15:
+                    record["confirm_attempts"] = int(record.get("confirm_attempts") or 0) + 1
+                    record["last_confirm_at"] = isoformat(now)
+                attempts = int(record.get("confirm_attempts") or 0)
+                if age_seconds >= 300 or (attempts >= 3 and age_seconds >= 60):
+                    hook = getattr(self, "_on_pending_failed", None)
+                    if hook:
+                        hook(service, record, torrents)
+                    else:
+                        url_key = str(record.get("url_key") or "")
+                        if url_key:
+                            self._state["processed_urls"].pop(url_key, None)
+                    resolved_ids.add(id(record))
                     self._append_history({
-                        **record,
-                        "event": "retry",
-                        "outcome": "重试",
-                        "reason": "qBittorrent 中未确认到已提交任务，已解除下载链接记录",
+                        **record, "event": "retry", "outcome": "重试",
+                        "reason": "qB 未确认提交，已撤销本次占位，允许后续 RSS 重试",
                     })
                     logger.warning(f"刷流追新未在 qBittorrent 确认到任务，将允许 RSS 重试：{title}")
-                else:
-                    record["confirm_attempts"] = attempts
-                    remaining.append(record)
-        self._state["pending_managed"] = remaining
+        if resolved_ids:
+            with self._job_guard:
+                self._state["pending_managed"] = [
+                    row for row in self._state.get("pending_managed", []) if id(row) not in resolved_ids
+                ]
 
     def _qb_service(
         self, downloader: Optional[str] = None, config: Optional[Dict[str, Any]] = None
@@ -1713,15 +1965,16 @@ class BrushFlowTracker(_PluginBase):
     def _find_site(self, site_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return next((site for site in self._sites if site["id"] == site_id), None)
 
-    def _site_summary(self, site: Dict[str, Any]) -> Dict[str, Any]:
-        stats = self._state["site_stats"].get(site["id"], {})
+    def _site_summary(self, site: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        state = state if state is not None else self._state_view()
+        stats = state["site_stats"].get(site["id"], {})
         return {
             "id": site["id"],
             "name": site["name"],
             "enabled": site["enabled"],
             "rss_rule_count": len(site.get("rss_rules") or []),
             "cleanup_rule_count": len(site.get("cleanup_rules") or []),
-            "managed_count": sum(1 for row in self._state["managed"].values() if row.get("site_id") == site["id"]),
+            "managed_count": sum(1 for row in state["managed"].values() if row.get("site_id") == site["id"]),
             "stats": stats,
         }
 
@@ -1732,7 +1985,10 @@ class BrushFlowTracker(_PluginBase):
         torrent: Optional[Dict[str, Any]] = None,
         site_id: Optional[str] = None,
     ) -> None:
-        record = self._state["managed"].pop(torrent_hash.lower(), {})
+        torrent_hash = torrent_hash.lower()
+        record = self._state["managed"].pop(torrent_hash, {})
+        self._state.setdefault("deleted_hashes", {})[torrent_hash] = isoformat(datetime.now().astimezone())
+        self._invalidate_torrent_cache()
         self._append_history(
             {
                 **record,
@@ -1767,25 +2023,25 @@ class BrushFlowTracker(_PluginBase):
         }
 
     def _start_job(self, operation: str, site_id: Optional[str]) -> Tuple[Optional[str], int]:
-        """Claim a job slot and recover a slot abandoned by a blocked I/O call.
-
-        Python cannot safely kill the thread that is blocked in a third-party
-        downloader or RSS client.  A lease therefore protects normal runs but
-        expires eventually, so one wedged request cannot disable this plugin
-        forever.  The token prevents the old thread from clearing a newer run.
-        """
+        """One live mutating worker; a timeout never licenses overlapping side effects."""
         now = time.monotonic()
-        timeout = self._job_timeouts[operation]
         with self._job_guard:
-            current = self._running_jobs.get(operation)
-            if current:
+            live_ids = {thread.ident for thread in threading.enumerate()}
+            for name, current in list(self._running_jobs.items()):
+                owner = current.get("owner")
+                alive = owner.is_alive() if owner is not None else current.get("thread_id") in live_ids
+                if not alive:
+                    self._running_jobs.pop(name, None)
+                    continue
                 elapsed = max(0, int(now - current["started_monotonic"]))
-                if elapsed < timeout:
-                    return None, elapsed
-                logger.error(
-                    f"刷流追新 {operation} 任务已运行 {elapsed} 秒，超过 {timeout} 秒保护时限；"
-                    "本轮将继续执行。请检查 RSS、qBittorrent 或插件数据存储的网络连接。"
-                )
+                if elapsed >= self._job_timeouts.get(name, 300) and not current.get("overdue_logged"):
+                    current["overdue_logged"] = True
+                    logger.warning(f"刷流追新 {name} 已运行 {elapsed} 秒；执行线程仍存活，跳过重入")
+                return None, elapsed
+            if self._pending_config is not None:
+                normalized, raw = self._pending_config
+                self._apply_config(normalized, raw)
+            self._published_state = copy.deepcopy(self._state)
             token = uuid.uuid4().hex
             self._running_jobs[operation] = {
                 "token": token,
@@ -1793,16 +2049,41 @@ class BrushFlowTracker(_PluginBase):
                 "started_monotonic": now,
                 "started_at": isoformat(datetime.now().astimezone()),
                 "thread_id": threading.get_ident(),
+                "owner": threading.current_thread(),
+                "config_revision": self._active_config_revision,
             }
             return token, 0
 
     def _finish_job(self, operation: str, token: str) -> None:
-        """Release the job slot before persistence so a stuck save cannot block work."""
+        """Drain the last save before releasing the worker and applying queued settings."""
         with self._job_guard:
             current = self._running_jobs.get(operation)
-            if current and current.get("token") == token:
-                self._running_jobs.pop(operation, None)
-        self._save_state_safely(operation)
+            if not current or current.get("token") != token:
+                return
+        applied = False
+        try:
+            self._save_state_safely(operation)
+        finally:
+            with self._job_guard:
+                current = self._running_jobs.get(operation)
+                if current and current.get("token") == token:
+                    self._running_jobs.pop(operation, None)
+                    self._published_state = copy.deepcopy(self._state)
+                    if self._pending_config is not None:
+                        normalized, raw = self._pending_config
+                        self._apply_config(normalized, raw)
+                        applied = True
+            if applied:
+                try:
+                    ThreadHelper().submit(self._refresh_scheduler)
+                except Exception as err:
+                    logger.warning(f"刷流追新应用待生效设置后更新调度失败：{err}")
+
+    def _state_view(self) -> Dict[str, Any]:
+        """Read a stable published snapshot while a background worker is mutating state."""
+        with self._job_guard:
+            state = self._published_state if self._running_jobs else self._state
+            return copy.deepcopy(state)
 
     def _running_job_status(self) -> Dict[str, Dict[str, Any]]:
         """Expose current job leases to the management page and status API."""
@@ -1818,21 +2099,36 @@ class BrushFlowTracker(_PluginBase):
                 for operation, entry in self._running_jobs.items()
             }
 
-    def _save_state_safely(self, operation: str) -> None:
-        """Persist state without letting storage failures hold a task lease forever."""
-        if not self._state_save_lock.acquire(blocking=False):
-            logger.warning(f"刷流追新 {operation} 状态保存仍在进行，本轮跳过保存")
-            return
+    def _save_state_safely(self, operation: str, retry: int = 0) -> None:
+        """A busy writer drains newer save requests; failures retain the dirty revision."""
         try:
-            self._save_state()
+            self._state_writer.save(self._save_state)
         except Exception as err:
             logger.error(f"刷流追新 {operation} 状态保存失败：{err}\n{traceback.format_exc()}")
-        finally:
-            self._state_save_lock.release()
+            if retry < 2:
+                try:
+                    ThreadHelper().submit(self._retry_state_save, operation, retry + 1)
+                except Exception as submit_error:
+                    logger.warning(f"刷流追新状态补写未提交，后续任务将继续重试：{submit_error}")
+
+    def _retry_state_save(self, operation: str, retry: int) -> None:
+        time.sleep(min(4, 2 ** (retry - 1)))
+        if self._state_writer.dirty:
+            self._save_state_safely(operation, retry)
 
     def _save_state(self) -> None:
-        self._state["processed_urls"] = dict(list(self._state["processed_urls"].items())[-20000:])
-        self.save_data(self.STATE_KEY, self._state)
+        # The durable store gets an independent JSON-compatible value, not a
+        # mutable alias to live runtime state. Never trim the live dict here.
+        with self._job_guard:
+            foreign_worker = any(
+                entry.get("thread_id") != threading.get_ident()
+                for entry in self._running_jobs.values()
+            )
+            source = self._published_state if foreign_worker else self._state
+            state = copy.deepcopy(source)
+        state["processed_urls"] = dict(list(state["processed_urls"].items())[-20000:])
+        state["deleted_hashes"] = dict(list(state.get("deleted_hashes", {}).items())[-20000:])
+        self.save_data(self.STATE_KEY, state)
 
     @staticmethod
     def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1847,6 +2143,11 @@ class BrushFlowTracker(_PluginBase):
         if raw_config.get("downloader_mode") not in {"moviepilot", "custom"}:
             raw_config["downloader_mode"] = "moviepilot"
         for site in raw_config.get("sites") or []:
+            for cleanup in site.get("cleanup_rules") or []:
+                if not any(key in cleanup for key in ("labels", "rss_rule_ids", "label_scope")):
+                    # Legacy omission freezes the current task set; explicit []
+                    # is always empty and must never expand to all remaining tasks.
+                    cleanup["labels"] = [rule.get("name") for rule in site.get("rss_rules") or [] if rule.get("name")]
             if "uid" not in site and site.get("site_uid"):
                 site["uid"] = site.get("site_uid")
             if "passkey" not in site and site.get("site_passkey"):
@@ -1895,8 +2196,30 @@ class BrushFlowTracker(_PluginBase):
                     if rule["id"] in seen_rules:
                         rule["id"] = uuid.uuid4().hex
                     seen_rules.add(rule["id"])
-            task_names = [rule["name"] for rule in site["rss_rules"]]
+            rss_by_id = {rule["id"]: rule for rule in site["rss_rules"]}
             for rule in site["cleanup_rules"]:
-                labels = [label for label in split_terms(rule.get("labels")) if label in task_names]
-                rule["labels"] = labels or list(task_names)
+                rule["scope_error"] = ""
+                if rule.get("label_scope") == "all":
+                    rule["labels"] = []
+                    rule["rss_rule_ids"] = []
+                    continue
+                ids = list(dict.fromkeys(split_terms(rule.get("rss_rule_ids"))))
+                labels = list(dict.fromkeys(split_terms(rule.get("labels"))))
+                if ids:
+                    missing = [value for value in ids if value not in rss_by_id]
+                    if missing:
+                        rule["scope_error"] = "关联的 RSS 任务已删除，请重新选择"
+                    rule["labels"] = [rss_by_id[value]["name"] for value in ids if value in rss_by_id]
+                else:
+                    for label in labels:
+                        matches = [row["id"] for row in site["rss_rules"] if row["name"] == label]
+                        if len(matches) != 1:
+                            rule["scope_error"] = "关联的 RSS 标签已删除或重名，请重新选择"
+                        else:
+                            ids.append(matches[0])
+                rule["rss_rule_ids"] = ids
+                if not ids or not labels and not rule.get("labels"):
+                    rule["scope_error"] = rule["scope_error"] or "未选择 RSS 任务"
+                if rule["scope_error"]:
+                    rule["enabled"] = False
         return data

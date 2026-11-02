@@ -83,6 +83,10 @@ class CleanupRulePayload(BaseModel):
     name: str = "删种规则"
     enabled: bool = True
     labels: List[str] = Field(default_factory=list)
+    # Names are qB labels; stable RSS ids are authoritative once migrated.
+    rss_rule_ids: List[str] = Field(default_factory=list)
+    label_scope: Literal["selected", "all"] = "selected"
+    scope_error: str = ""
     min_seed_hours: float = Field(default=0, ge=0)
     min_ratio: float = Field(default=0, ge=0)
     delete_files: bool = False
