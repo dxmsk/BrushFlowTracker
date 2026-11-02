@@ -124,7 +124,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.24"
+    plugin_version = "1.1.25"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -133,10 +133,10 @@ class BrushFlowTracker(_PluginBase):
 
     STATE_KEY = "runtime_state"
 
-    def init_plugin(self, config: dict = None) -> None:
+    def init_plugin(self, config: dict = None, _normalized: dict = None) -> None:
         """Publish configuration only between runs; never replace an active run's state."""
         raw_config = config or {}
-        normalized = self._normalize_config(raw_config)
+        normalized = _normalized or self._normalize_config(raw_config)
         if not hasattr(self, "_job_guard"):
             self._job_guard = threading.RLock()
             self._running_jobs = {}
@@ -344,8 +344,11 @@ class BrushFlowTracker(_PluginBase):
 
     def get_tasks(self, site_id: Optional[str] = None, force: bool = False) -> schemas.Response:
         """独立读取实时 qB 任务，使页面和设置无需等待下载器响应。"""
-        selected_id = site_id or (self._sites[0]["id"] if self._sites else None)
-        selected = self._find_site(selected_id)
+        with self._job_guard:
+            config = copy.deepcopy(self._requested_config)
+        state = self._state_view()
+        selected_id = site_id or (config["sites"][0]["id"] if config.get("sites") else None)
+        selected = next((site for site in config["sites"] if site["id"] == selected_id), None)
         tasks: List[Dict[str, Any]] = []
         downloader_error = None
         if selected:
@@ -355,7 +358,7 @@ class BrushFlowTracker(_PluginBase):
             data={
                 "tasks": tasks,
                 "downloader_error": downloader_error,
-                "sites": [self._site_summary(site) for site in self._sites],
+                "sites": [self._site_summary(site, state) for site in config["sites"]],
             },
         )
 
@@ -364,7 +367,7 @@ class BrushFlowTracker(_PluginBase):
         config = self._normalize_config(payload.model_dump())
         with self._job_guard:
             self.update_config(config)
-            self.init_plugin(config)
+            self.init_plugin(config, _normalized=config)
         try:
             ThreadHelper().submit(self._refresh_scheduler)
         except Exception as err:
@@ -659,31 +662,31 @@ class BrushFlowTracker(_PluginBase):
                 candidates = []
                 for raw in raw_items or []:
                     item = normalize_item(raw, now)
-                    url_key = hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
+                    item["url_key"] = hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
+                    url_key = item["url_key"]
                     if url_key in self._state.get("dead_seed_urls", {}):
                         result["dead_seed_skipped"] += 1
                         self._log_selection(site, rule, item, "排除", "该下载链接此前判定为死种")
                         continue
                     promotion_filter = rule.get("promotion")
-                    if promotion_filter in {"free", "free_or_2xfree", "2xfree"}:
-                        pre_matched, pre_reason = match_rule(item, {**rule, "promotion": "any"}, now)
-                        if not pre_matched:
-                            result[f"filtered:{pre_reason}"] += 1
-                            self._log_selection(site, rule, item, "排除", pre_reason)
-                            continue
-                    effective_rule = rule
-                    if promotion_filter in {"free", "free_or_2xfree", "2xfree"} and not item.get("promotion_known"):
-                        effective_rule = {**rule, "promotion": "any"}
-                        result["promotion_unknown_allowed"] += 1
-                        logger.info(
-                            f"刷流追新无法确认免费状态，按其他筛选条件继续：站点={site.get('name')} | "
-                            f"任务={rule.get('name')} | 名称={item.get('title')} | 链接={item.get('enclosure')}"
-                        )
-                    matched, reason = match_rule(item, effective_rule, now)
+                    matched, reason = match_rule(item, rule, now)
                     if not matched:
-                        result[f"filtered:{reason}"] += 1
-                        self._log_selection(site, rule, item, "排除", reason)
-                        continue
+                        if (promotion_filter in {"free", "free_or_2xfree", "2xfree"}
+                                and reason in {"不是免费种", "不在免费促销期", "不是双倍上传免费种"}):
+                            if not item.get("promotion_known"):
+                                result["promotion_unknown_allowed"] += 1
+                                logger.info(
+                                    f"刷流追新无法确认免费状态，按其他筛选条件继续：站点={site.get('name')} | "
+                                    f"任务={rule.get('name')} | 名称={item.get('title')} | 链接={item.get('enclosure')}"
+                                )
+                            else:
+                                result[f"filtered:{reason}"] += 1
+                                self._log_selection(site, rule, item, "排除", reason)
+                                continue
+                        else:
+                            result[f"filtered:{reason}"] += 1
+                            self._log_selection(site, rule, item, "排除", reason)
+                            continue
                     candidates.append(item)
                 result["matched"] += len(candidates)
                 if self._highest_resolution_dedup:
@@ -966,10 +969,14 @@ class BrushFlowTracker(_PluginBase):
 
     @staticmethod
     def _identity_fields(item: Dict[str, Any]) -> Dict[str, Any]:
-        return {key: copy.deepcopy(item.get(key)) for key in (
+        result = {key: item.get(key) for key in (
             "identity", "identity_version", "identity_uncertain", "media_key", "subtitle",
             "description", "series_alias", "resolution", "resolution_rank", "quality_rank", "size", "seeders",
         )}
+        identity = result.get("identity")
+        if isinstance(identity, dict):
+            result["identity"] = dict(identity)
+        return result
 
     def _same_media(self, left: Dict[str, Any], right: Dict[str, Any]) -> bool:
         left_item, right_item = self._managed_item(left), self._managed_item(right)
@@ -984,12 +991,20 @@ class BrushFlowTracker(_PluginBase):
 
     def _inferior_managed_hashes(self, _site_id: str, item: Dict[str, Any]) -> List[str]:
         """Only confidently identified copies may participate in replacement."""
+        key = str(item.get("media_key") or "")
+        if not key or item.get("identity_uncertain"):
+            return []
         inferior = []
         for torrent_hash, record in self._state.get("managed", {}).items():
-            current = self._managed_item(record)
-            if not self._same_media(item, current):
+            if record.get("media_key") != key or record.get("identity_uncertain"):
                 continue
-            if self._recovery_blocked(record) or self._selection_preference(item) > self._selection_preference(current):
+            if self._recovery_blocked(record):
+                inferior.append(str(torrent_hash).lower())
+                continue
+            current = self._managed_item(record)
+            if not current.get("media_key") or current["media_key"] != key:
+                continue
+            if self._selection_preference(item) > self._selection_preference(current):
                 inferior.append(str(torrent_hash).lower())
         return inferior
 
@@ -1465,11 +1480,12 @@ class BrushFlowTracker(_PluginBase):
         return BrushFlowTracker._append_site_auth(url, site, include_rss_key=True)
 
     def _add_item(self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any], service: Any) -> bool:
-        item = normalize_item(item)
+        # Item is already normalized by _scan_site / _flush_pending_candidates.
         task_name = str(rule.get("name") or "RSS 任务").strip()
         tags = [task_name]
         existing_hashes: Optional[set] = None
         before_add: Optional[List[Dict[str, Any]]] = None
+        is_batch = isinstance(service.instance, BatchTorrentView)
         if hasattr(service.instance, "get_torrents"):
             try:
                 before_add, failed = service.instance.get_torrents()
@@ -1484,10 +1500,13 @@ class BrushFlowTracker(_PluginBase):
             except Exception as error:
                 before_add = None
                 logger.warning(f"刷流追新添加前读取 qB 任务快照失败：{error}")
-        for torrent in before_add or []:
-            record = self._state["managed"].get(str(torrent.get("hash") or "").lower())
-            if record:
-                record.update(self._identity_fields(self._managed_item(record, torrent)))
+        # In batch mode the snapshot is stale; refreshing managed from it on
+        # every add is O(N×M) for no benefit — reconcile handles it once later.
+        if not is_batch:
+            for torrent in before_add or []:
+                record = self._state["managed"].get(str(torrent.get("hash") or "").lower())
+                if record:
+                    record.update(self._identity_fields(self._managed_item(record, torrent)))
         inferior_hashes = self._inferior_managed_hashes(site["id"], item) if self._highest_resolution_dedup else []
         success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
         if not success:
@@ -1498,10 +1517,10 @@ class BrushFlowTracker(_PluginBase):
                 service, task_name, item["title"], existing_hashes=existing_hashes
             )
         now = datetime.now().astimezone()
-        identity = normalize_item(item, now)
+        url_key = str(item.get("url_key") or "") or hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
         record = {
-            **self._identity_fields(identity),
-            "identity_uncertain": bool(identity.get("identity_uncertain")),
+            **self._identity_fields(item),
+            "identity_uncertain": bool(item.get("identity_uncertain")),
             "add_token": uuid.uuid4().hex,
             "download_url": item["enclosure"],
             "recovery_state": "downloading" if hashes else "pending",
@@ -1512,9 +1531,9 @@ class BrushFlowTracker(_PluginBase):
             "title": item["title"],
             "link": item.get("link") or item.get("enclosure"),
             "resolution": item["resolution"],
-            "resolution_rank": item.get("resolution_rank", identity["resolution_rank"]),
-            "quality_rank": item.get("quality_rank", identity["quality_rank"]),
-            "media_key": item.get("media_key", identity["media_key"]),
+            "resolution_rank": item.get("resolution_rank"),
+            "quality_rank": item.get("quality_rank"),
+            "media_key": item.get("media_key"),
             "series_alias": item.get("series_alias"),
             "description": item.get("description") or item.get("summary") or item.get("subtitle") or "",
             "size": item.get("size") or 0,
@@ -1537,7 +1556,7 @@ class BrushFlowTracker(_PluginBase):
         if not hashes:
             self._state["pending_managed"].append({
                 **record,
-                "url_key": hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest(),
+                "url_key": url_key,
                 "confirm_attempts": 0,
                 "existing_hashes": sorted(existing_hashes or []),
                 "replace_hashes": replace_hashes,
@@ -2068,11 +2087,12 @@ class BrushFlowTracker(_PluginBase):
                 current = self._running_jobs.get(operation)
                 if current and current.get("token") == token:
                     self._running_jobs.pop(operation, None)
-                    self._published_state = copy.deepcopy(self._state)
                     if self._pending_config is not None:
                         normalized, raw = self._pending_config
                         self._apply_config(normalized, raw)
                         applied = True
+                    else:
+                        self._published_state = copy.deepcopy(self._state)
             if applied:
                 try:
                     ThreadHelper().submit(self._refresh_scheduler)

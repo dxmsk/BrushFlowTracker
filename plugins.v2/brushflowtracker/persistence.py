@@ -23,13 +23,13 @@ class CoalescingWriter:
         with self._guard:
             return self._written < self._requested
 
-    def save(self, callback: Callable[[], None]) -> bool:
+    def save(self, callback: Callable[[], None], max_drain: int = 5) -> bool:
         with self._guard:
             self._requested += 1
             if self._active:
                 return False
             self._active = True
-        while True:
+        for _round in range(max_drain):
             with self._guard:
                 revision = self._requested
             try:
@@ -43,3 +43,8 @@ class CoalescingWriter:
                 if self._requested == revision:
                     self._active = False
                     return True
+        # Exceeded max_drain rounds; release without a clean finish so a
+        # later caller can pick up the remaining dirty revision.
+        with self._guard:
+            self._active = False
+        return False
