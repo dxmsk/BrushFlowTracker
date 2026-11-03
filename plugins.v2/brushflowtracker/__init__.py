@@ -1,4 +1,4 @@
-"""MoviePilot v2 刷流追新插件。"""
+"""MoviePilot V2/V3 刷流追新插件。"""
 
 from __future__ import annotations
 
@@ -17,13 +17,41 @@ from html import unescape
 from types import SimpleNamespace
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
-from app import schemas
-from app.helper.downloader import DownloaderHelper
-from app.helper.rss import RssHelper
-from app.helper.thread import ThreadHelper
-from app.log import logger
-from app.plugins import _PluginBase
-from app.scheduler import Scheduler
+# V2/V3 dual-host compatible imports
+try:
+    from app import schemas
+except ImportError:
+    from app.sdk import schemas  # type: ignore
+
+try:
+    from app.helper.downloader import DownloaderHelper
+except ImportError:
+    from app.sdk.services import DownloaderHelper  # type: ignore
+
+try:
+    from app.helper.rss import RssHelper
+except ImportError:
+    from app.sdk.services import RssHelper  # type: ignore
+
+try:
+    from app.helper.thread import ThreadHelper
+except ImportError:
+    from app.sdk.services import ThreadHelper  # type: ignore
+
+try:
+    from app.log import logger
+except ImportError:
+    from app.sdk.logging import logger  # type: ignore
+
+try:
+    from app.plugins import _PluginBase
+except ImportError:
+    from app.sdk.plugins import _PluginBase  # type: ignore
+
+try:
+    from app.scheduler import Scheduler
+except ImportError:
+    from app.sdk.services import Scheduler  # type: ignore
 
 from .core import (
     first_cleanup_rule,
@@ -124,7 +152,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.25"
+    plugin_version = "1.1.26"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -1338,8 +1366,14 @@ class BrushFlowTracker(_PluginBase):
         if not detail_url:
             return None
         try:
-            from app.db.site_oper import SiteOper
-            from app.utils.http import RequestUtils
+            try:
+                from app.db.site_oper import SiteOper
+            except ImportError:
+                from app.sdk.services import SiteOper  # type: ignore
+            try:
+                from app.utils.http import RequestUtils
+            except ImportError:
+                from app.sdk.network import RequestUtils  # type: ignore
 
             domain = (urlsplit(detail_url).hostname or "").lower()
             auth_cache = getattr(self, "_site_auth_cache", {})
@@ -1391,7 +1425,10 @@ class BrushFlowTracker(_PluginBase):
     def _proxy_config() -> Any:
         """按需读取 MoviePilot 全局代理配置，避免测试环境强依赖 settings。"""
         try:
-            from app.core.config import settings
+            try:
+                from app.core.config import settings
+            except ImportError:
+                from app.sdk.config import settings  # type: ignore
             return settings.PROXY
         except Exception:
             return None
