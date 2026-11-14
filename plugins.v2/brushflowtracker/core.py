@@ -1,0 +1,653 @@
+"""刷流追新的无副作用规则与数据标准化函数。"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html import unescape
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+RESOLUTION_RANK = {
+    "other": 0,
+    "480p": 1,
+    "576p": 1,
+    "720p": 2,
+    "1080i": 3,
+    "1080p": 4,
+    "2160p": 5,
+    "4k": 5,
+    "8k": 6,
+}
+
+RESOLUTION_PATTERNS = (
+    ("8K", re.compile(r"(?<!\d)(?:8K|4320P)(?!\d)", re.I)),
+    ("4K", re.compile(r"(?<!\d)(?:4K|UHD|2160[PI])(?!\d)", re.I)),
+    ("1080P", re.compile(r"(?<!\d)1080P(?!\d)", re.I)),
+    ("1080I", re.compile(r"(?<!\d)1080I(?!\d)", re.I)),
+    ("720P", re.compile(r"(?<!\d)720P(?!\d)", re.I)),
+    ("576P", re.compile(r"(?<!\d)576P(?!\d)", re.I)),
+    ("480P", re.compile(r"(?<!\d)480P(?!\d)", re.I)),
+)
+
+FREE_MARKER = re.compile(r"(?:免费|免費|free(?:\s*leech|\s*download)?)(?![a-z])", re.I)
+TWO_X_MARKER = re.compile(r"(?:2\s*[xX倍].*(?:FREE|免费|免費)|(?:FREE|免费|免費).*?2\s*[xX倍])", re.I)
+FREE_UNTIL_PATTERNS = (
+    re.compile(
+        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?|免費(?:截止|結束|到期)(?:時間)?)[\s:：-]*"
+        r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
+        re.I,
+    ),
+    re.compile(
+        r"(?:free\s*(?:until|ends?)|免费(?:截止|结束|到期)(?:时间)?|免費(?:截止|結束|到期)(?:時間)?)[\s:：-]*"
+        r"(\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
+        re.I,
+    ),
+)
+FREE_REMAINING = re.compile(
+    r"(?:free\s*(?:left|remaining)|免费(?:剩余|剩餘)(?:时间|時間)?|(?:剩余|剩餘)(?:时间|時間))[\s:：-]*"
+    r"(?:(\d+)\s*(?:天|日|d(?:ays?)?))?\s*"
+    r"(?:(\d+)\s*(?:小时|小時|时|時|h(?:ours?)?))?\s*"
+    r"(?:(\d+)\s*(?:分钟|分鐘|分|m(?:in(?:utes?)?)?))?",
+    re.I,
+)
+
+
+def split_terms(value: Any) -> List[str]:
+    """将数组或逗号、换行分隔文本标准化为非空字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = re.split(r"[,，\n]", str(value))
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def parse_datetime(value: Any, now: Optional[datetime] = None) -> Optional[datetime]:
+    """把常见 RSS 日期、时间戳或 ISO 文本解析为带时区时间。"""
+    if value in (None, ""):
+        return None
+    reference = now or datetime.now().astimezone()
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, (int, float)) or str(value).strip().isdigit():
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000
+        result = datetime.fromtimestamp(number, tz=reference.tzinfo)
+    else:
+        text = str(value).strip()
+        result = None
+        try:
+            result = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                result = parsedate_to_datetime(text)
+            except (TypeError, ValueError, OverflowError):
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        result = datetime.strptime(text, fmt)
+                        break
+                    except ValueError:
+                        continue
+        if result is None:
+            return None
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=reference.tzinfo or timezone.utc)
+    return result.astimezone(reference.tzinfo or timezone.utc)
+
+
+def detect_resolution(title: str) -> Tuple[str, int]:
+    """识别标题分辨率并返回展示值与排序等级。"""
+    for label, pattern in RESOLUTION_PATTERNS:
+        if pattern.search(title or ""):
+            return label, RESOLUTION_RANK[label.lower()]
+    return "OTHER", RESOLUTION_RANK["other"]
+
+
+def _episode_identity(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Extract season and exact episode/range from common PT title formats."""
+    compact = re.search(
+        r"(?<![A-Z0-9])S\s*0*(\d{1,3})\s*E\s*0*(\d{1,4})"
+        r"(?:\s*[-~至到]\s*(?:E\s*)?0*(\d{1,4}))?(?!\d)",
+        text,
+    )
+    if compact:
+        season, start, end = compact.groups()
+        return int(season), int(start), int(end or start)
+
+    season_match = re.search(r"(?<![A-Z0-9])S\s*0*(\d{1,3})(?!\d)", text)
+    chinese = re.search(
+        r"第\s*0*(\d{1,4})\s*(?:[-~至到]\s*0*(\d{1,4}))?\s*[集话話期]",
+        text,
+    )
+    if chinese:
+        start, end = chinese.groups()
+        return int(season_match.group(1)) if season_match else 1, int(start), int(end or start)
+    return (int(season_match.group(1)), None, None) if season_match else (None, None, None)
+
+
+def _canonical_series_title(text: str) -> str:
+    """Extract and normalize the release's series name before technical metadata."""
+    markers = []
+    for pattern in (
+        r"(?<!\d)20\d{2}(?!\d)",
+        r"(?<![A-Z0-9])S\s*\d{1,3}(?!\d)",
+        r"(?<!\d)(?:8K|4K|UHD|4320P|2160[PI]|1080[PI]|720P|576P|480P)(?!\d)",
+    ):
+        match = re.search(pattern, text)
+        if match and match.start() > 0:
+            markers.append(match.start())
+    title = text[:min(markers)] if markers else text
+    words = re.findall(r"[A-Z0-9]+", title)
+    normalized = []
+    for word in words:
+        # PT sites occasionally use singular/plural variants for the same English title.
+        if len(word) > 4 and word.endswith("S") and not word.endswith("SS"):
+            word = word[:-1]
+        normalized.append(word)
+    return " ".join(normalized)
+
+
+def _chinese_series_alias(text: str) -> Optional[str]:
+    """Extract a Chinese series name immediately before a Chinese episode marker."""
+    cleaned = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", text or ""))
+    match = re.search(
+        r"([\u4e00-\u9fff][\u4e00-\u9fff0-9· ]{1,30}?)\s*第\s*0*\d{1,4}"
+        r"(?:\s*[-~至到]\s*0*\d{1,4})?\s*[集话話期]",
+        cleaned,
+    )
+    if not match:
+        return None
+    alias = re.sub(r"[\s|丨:：/\\·]+$", "", match.group(1)).strip()
+    return alias if len(alias) >= 2 else None
+
+
+def media_key(title: str, context: str = "", subtitle: str = "") -> str:
+    """生成跨分辨率稳定的影视身份键，用于持久化最高画质去重。"""
+    raw_text = unicodedata.normalize("NFKC", title or "")
+    context_text = unicodedata.normalize("NFKC", context or "")
+    subtitle_text = re.sub(r"<[^>]+>", " ", unicodedata.normalize("NFKC", subtitle or "")).strip()
+    metadata_text = f"{context_text} {subtitle_text}".strip()
+    alias = _chinese_series_alias(metadata_text) if metadata_text else None
+    text = raw_text.upper()
+    combined = f"{raw_text} {metadata_text}".upper()
+    series = _canonical_series_title(text)
+    season, episode_start, episode_end = _episode_identity(combined)
+    if alias:
+        season = season or 1
+        series = alias
+    identity = [series or re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip()]
+    if season is not None:
+        identity.append(f"S{season}")
+    if episode_start is not None:
+        identity.append(f"E{episode_start}-{episode_end}")
+    return hashlib.sha1("|".join(identity).encode("utf-8")).hexdigest()[:24]
+
+
+def quality_rank(title: str, resolution_rank: Optional[int] = None) -> int:
+    """Return a quality score with resolution as the strongest signal."""
+    text = unicodedata.normalize("NFKC", title or "").upper()
+    rank = int(resolution_rank if resolution_rank is not None else detect_resolution(text)[1])
+    score = rank * 1_000_000
+
+    if re.search(r"\b(?:DOLBY\s*VISION|DOVI|DV)\b", text):
+        score += 40_000
+    elif re.search(r"\bHDR10\+|\bHDR10PLUS\b", text):
+        score += 30_000
+    elif re.search(r"\bHDR10\b", text):
+        score += 20_000
+    elif re.search(r"\bHDR\b", text):
+        score += 15_000
+
+    if re.search(r"\bREMUX\b", text):
+        score += 5_000
+    elif re.search(r"\b(?:BLU-?RAY|BDRIP)\b", text):
+        score += 4_000
+    elif re.search(r"\bWEB-?DL\b", text):
+        score += 3_000
+    elif re.search(r"\bWEBRIP\b", text):
+        score += 2_000
+    elif re.search(r"\bHDTV\b", text):
+        score += 1_000
+
+    if re.search(r"\bAV1\b", text):
+        score += 900
+    elif re.search(r"\b(?:X265|H265|H\.265|HEVC)\b", text):
+        score += 800
+    elif re.search(r"\b(?:X264|H264|H\.264|AVC)\b", text):
+        score += 600
+    if re.search(r"\b(?:10\s*BIT|10BIT)\b", text):
+        score += 200
+
+    if re.search(r"\bTRUEHD\b.*\bATMOS\b|\bATMOS\b.*\bTRUEHD\b", text):
+        score += 90
+    elif re.search(r"\bDTS-?HD\b", text):
+        score += 80
+    elif re.search(r"\b(?:DDP(?:\d(?:\.\d)?)?|E-?AC-?3)\b", text):
+        score += 60
+    elif re.search(r"\bDTS\b", text):
+        score += 50
+    elif re.search(r"\bAAC\b", text):
+        score += 20
+    return score
+
+
+def item_quality_rank(item: Dict[str, Any]) -> int:
+    """Read a normalized score while remaining compatible with old records."""
+    stored = item.get("quality_rank")
+    if stored is not None:
+        try:
+            return int(stored)
+        except (TypeError, ValueError):
+            pass
+    return quality_rank(str(item.get("title") or ""), int(item.get("resolution_rank") or 0))
+
+
+def item_preference(item: Dict[str, Any]) -> Tuple[int, int]:
+    """Rank by detected quality first, then prefer the larger torrent."""
+    size = max(0, int(_number(item.get("size"), 0) or 0))
+    return item_quality_rank(item), size
+
+
+def seed_availability(item: Dict[str, Any]) -> Optional[int]:
+    """Read an RSS seed count when the site exposes one; None means unknown."""
+    fields = list(_iter_fields(item))
+    names = {"seeders", "seeds", "seed", "numseeders", "seedercount", "complete"}
+    for key, value in fields:
+        if key not in names:
+            continue
+        try:
+            number = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            continue
+        if number >= 0:
+            return number
+    text = " ".join(str(value or "") for key, value in fields if key in {"title", "description", "summary"})
+    match = re.search(r"(?:SEED(?:ER)?S?|做种|种子)\s*[:：]?\s*(\d+)", text, re.I)
+    return int(match.group(1)) if match else None
+
+
+def item_downloadability(item: Dict[str, Any]) -> int:
+    """2 = has seeders, 1 = unknown, 0 = explicitly zero seeders."""
+    seeders = item.get("seeders")
+    if seeders is None:
+        seeders = seed_availability(item)
+    if seeders is None:
+        return 1
+    try:
+        return 2 if int(seeders) > 0 else 0
+    except (TypeError, ValueError):
+        return 1
+
+
+def item_preference_with_availability(item: Dict[str, Any]) -> Tuple[int, int, int]:
+    """Prefer downloadable releases, then quality, then larger size."""
+    quality, size = item_preference(item)
+    return item_downloadability(item), quality, size
+
+
+def promotion_of(item: Dict[str, Any]) -> str:
+    """识别普通、免费和双倍上传免费促销。"""
+    fields = list(_iter_fields(item))
+    explicit = str(item.get("promotion") or "").strip().casefold()
+    if explicit in {"normal", "free", "2xfree"}:
+        return explicit
+    download_factor = _field_number(fields, {"downloadvolumefactor", "downloadfactor", "downloadmultiplier", "downmultiplier"})
+    upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
+    free_flag = _field_bool(fields, {"free", "freeleech", "isfree", "isfreeleech"})
+    text = " ".join(str(value or "") for _key, value in fields)
+    is_free = download_factor == 0 or free_flag or bool(FREE_MARKER.search(text))
+    is_two_x = (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text))
+    if is_free and is_two_x:
+        return "2xfree"
+    if is_free:
+        return "free"
+    return "normal"
+
+
+def promotion_known(item: Dict[str, Any]) -> bool:
+    """判断 RSS 是否明确提供了促销信息，而不是把缺失字段当成普通种。"""
+    fields = list(_iter_fields(item))
+    known_names = {
+        "promotion", "downloadvolumefactor", "downloadfactor", "downloadmultiplier",
+        "downmultiplier", "free", "freeleech", "isfree", "isfreeleech",
+        "freedate", "freeuntil", "freeend", "promotionend",
+    }
+    if any(key in known_names for key, _value in fields):
+        return True
+    text = " ".join(str(value or "") for key, value in fields if key in {"title", "description"})
+    return bool(FREE_MARKER.search(text) or TWO_X_MARKER.search(text))
+
+
+def free_until_of(item: Dict[str, Any], now: Optional[datetime] = None) -> Optional[datetime]:
+    """从结构化字段或描述文本提取免费截止时间。"""
+    reference = now or datetime.now().astimezone()
+    for key in ("freedate", "free_until", "free_end", "promotion_end"):
+        parsed = parse_datetime(item.get(key), reference)
+        if parsed:
+            return parsed
+    text = " ".join(str(item.get(key) or "") for key in ("title", "description"))
+    for pattern in FREE_UNTIL_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        raw = match.group(1).replace("/", "-").replace(".", "-")
+        if re.match(r"^\d{1,2}-\d{1,2}", raw):
+            raw = f"{reference.year}-{raw}"
+        parsed = parse_datetime(raw, reference)
+        if parsed and parsed < reference - timedelta(days=2):
+            parsed = parsed.replace(year=parsed.year + 1)
+        return parsed
+    remaining = FREE_REMAINING.search(text)
+    if remaining and any(remaining.groups()):
+        days, hours, minutes = (int(value or 0) for value in remaining.groups())
+        return reference + timedelta(days=days, hours=hours, minutes=minutes)
+    return None
+
+
+def normalize_item(raw: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """把 MoviePilot RSS 结果标准化为选种流程使用的字段。"""
+    raw = _coerce_mapping(raw)
+    title = str(_value_from_raw(raw, "title") or "").strip()
+    resolution, rank = detect_resolution(title)
+    fields = list(_iter_fields(raw))
+    pubdate_value = _field_value(
+        fields,
+        {"pubdate", "published", "publishedat", "publicationdate", "createdat", "addedat", "date", "updated", "timestamp"},
+    )
+    pubdate = parse_datetime(pubdate_value, now)
+    promotion = promotion_of(raw)
+    free_until = free_until_of(raw, now)
+    # 有些站点只在描述中输出“剩余时间”，不输出 FREE 标签或下载因子。
+    # 只要能解析出未来的免费截止时间，就应视为免费种，避免被免费规则误排除。
+    if promotion == "normal" and free_until:
+        fields = list(_iter_fields(raw))
+        upload_factor = _field_number(fields, {"uploadvolumefactor", "uploadfactor", "uploadmultiplier", "upmultiplier"})
+        text = " ".join(str(value or "") for _key, value in fields)
+        promotion = "2xfree" if (upload_factor is not None and upload_factor >= 2) or bool(TWO_X_MARKER.search(text)) else "free"
+    enclosure = _enclosure_from_raw(raw)
+    subtitle_value = str(_value_from_raw(raw, "subtitle") or "").strip()
+    description = str(
+        _value_from_raw(raw, "description")
+        or _value_from_raw(raw, "summary")
+        or _value_from_raw(raw, "subtitle")
+        or _value_from_raw(raw, "content")
+        or ""
+    )
+    if not pubdate:
+        pubdate = _pubdate_from_text(f"{title} {description}", now)
+    size_value = _field_value(fields, {"size", "length", "filesize", "contentlength"})
+    size = int(_number(size_value, 0) or 0)
+    if size <= 0:
+        size = _size_from_text(str(size_value or "")) or _size_from_text(f"{title} {description}")
+    return {
+        **raw,
+        "title": title,
+        "description": description,
+        "enclosure": enclosure,
+        "size": size,
+        "seeders": seed_availability(raw),
+        "pubdate": pubdate,
+        "resolution": resolution,
+        "resolution_rank": rank,
+        "quality_rank": quality_rank(title, rank),
+        "subtitle": subtitle_value,
+        "media_key": media_key(title, description, subtitle_value),
+        "series_alias": _chinese_series_alias(
+            f"{title} {description}"
+        ),
+        "promotion": promotion,
+        "promotion_known": promotion_known(raw) or bool(free_until),
+        "free_until": free_until,
+    }
+
+
+def match_rule(item: Dict[str, Any], rule: Dict[str, Any], now: Optional[datetime] = None) -> Tuple[bool, str]:
+    """判断标准化 RSS 条目是否满足一条选种规则。"""
+    if not item.get("title") or not item.get("enclosure"):
+        return False, "条目缺少标题或下载地址"
+    haystack = f"{item.get('title', '')}\n{item.get('description', '')}".casefold()
+    whitelist = split_terms(rule.get("whitelist_keywords") or rule.get("required_keywords"))
+    blacklist = split_terms(rule.get("blacklist_keywords") or rule.get("excluded_keywords"))
+    blacklist_hits = [term for term in blacklist if term.casefold() in haystack]
+    if blacklist_hits:
+        return False, f"命中黑名单关键词：{', '.join(blacklist_hits)}"
+    whitelist_missing = [term for term in whitelist if term.casefold() not in haystack]
+    if whitelist_missing:
+        return False, f"缺少白名单关键词：{', '.join(whitelist_missing)}"
+    resolutions = {str(value).upper() for value in rule.get("resolutions") or []}
+    if resolutions and item.get("resolution") not in resolutions:
+        return False, "分辨率不匹配"
+    size_factors = {"kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+    size_from_value = _number(rule.get("size_from_value"), None)
+    size_to_value = _number(rule.get("size_to_value"), None)
+    size_from = (
+        size_from_value * size_factors.get(str(rule.get("size_from_unit") or "gib").lower(), 1024 ** 3)
+        if size_from_value is not None else None
+    )
+    size_to = (
+        size_to_value * size_factors.get(str(rule.get("size_to_unit") or "gib").lower(), 1024 ** 3)
+        if size_to_value is not None else None
+    )
+    if size_from is None:
+        legacy_size_from = _number(rule.get("size_from_gib"), None)
+        size_from = legacy_size_from * 1024 ** 3 if legacy_size_from is not None else None
+    if size_to is None:
+        legacy_size_to = _number(rule.get("size_to_gib"), None)
+        size_to = legacy_size_to * 1024 ** 3 if legacy_size_to is not None else None
+    if size_from is not None or size_to is not None:
+        size = int(item.get("size") or 0)
+        if size <= 0:
+            return False, "缺少文件大小，无法判断范围"
+        if (size_from is not None and size < size_from) or (size_to is not None and size > size_to):
+            return False, "文件大小不在范围"
+    age_factors = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+    age_from_value = _number(rule.get("publish_age_from_value"), None)
+    age_to_value = _number(rule.get("publish_age_to_value"), None)
+    age_from = (
+        age_from_value * age_factors.get(str(rule.get("publish_age_from_unit") or "minutes").lower(), 60)
+        if age_from_value is not None else None
+    )
+    age_to = (
+        age_to_value * age_factors.get(str(rule.get("publish_age_to_unit") or "minutes").lower(), 60)
+        if age_to_value is not None else None
+    )
+    if age_from is None:
+        legacy_age_from = _number(rule.get("publish_age_from_minutes"), None)
+        age_from = legacy_age_from * 60 if legacy_age_from is not None else None
+    if age_to is None:
+        legacy_age_to = _number(rule.get("publish_age_to_minutes"), None)
+        age_to = legacy_age_to * 60 if legacy_age_to is not None else None
+    pubdate = item.get("pubdate")
+    reference = now or datetime.now().astimezone()
+    if age_from is not None or age_to is not None:
+        if not pubdate:
+            return False, "缺少发种时间，无法判断范围"
+        age_seconds = (reference - pubdate).total_seconds()
+        lower_bound = age_from if age_from is not None else 0
+        if age_seconds < lower_bound or (age_to is not None and age_seconds > age_to):
+            return False, "发种时间不在范围"
+    promotion_filter = rule.get("promotion", "any")
+    if promotion_filter == "free" and item.get("promotion") != "free":
+        return False, "不是免费种"
+    if promotion_filter == "free_or_2xfree" and item.get("promotion") not in {"free", "2xfree"}:
+        return False, "不在免费促销期"
+    if promotion_filter == "2xfree" and item.get("promotion") != "2xfree":
+        return False, "不是双倍上传免费种"
+    return True, "命中"
+
+
+def choose_highest(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """同一批候选中仅保留每个影视身份的最高分辨率条目。"""
+    chosen: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for item in items:
+        key = str(item.get("media_key") or media_key(str(item.get("title") or "")))
+        if key not in chosen:
+            chosen[key] = item
+            order.append(key)
+        elif item_preference_with_availability(item) > item_preference_with_availability(chosen[key]):
+            chosen[key] = item
+    return [chosen[key] for key in order]
+
+
+def dedup_allows(item: Dict[str, Any], records: Dict[str, Dict[str, Any]]) -> bool:
+    """判断持久化记录是否允许下载当前最高画质候选。"""
+    record = records.get(str(item.get("media_key") or ""))
+    if not record:
+        return True
+    return item_preference_with_availability(item) > item_preference_with_availability(record)
+
+
+def torrent_tags(torrent: Dict[str, Any]) -> List[str]:
+    """将 qBittorrent 标签字段标准化为列表。"""
+    return split_terms(torrent.get("tags"))
+
+
+def first_cleanup_rule(
+    torrent: Dict[str, Any], rules: Iterable[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """按配置顺序返回首条同时满足标签和阈值的删种规则。"""
+    tags = set(torrent_tags(torrent))
+    ratio = float(_number(torrent.get("ratio"), 0) or 0)
+    seeding_time = float(_number(torrent.get("seeding_time"), 0) or 0)
+    for rule in rules:
+        if not rule.get("enabled", True):
+            continue
+        required_tags = set(split_terms(rule.get("labels")))
+        if required_tags and required_tags.isdisjoint(tags):
+            continue
+        if seeding_time < float(rule.get("min_seed_hours") or 0) * 3600:
+            continue
+        if ratio < float(rule.get("min_ratio") or 0):
+            continue
+        return rule
+    return None
+
+
+def isoformat(value: Optional[datetime]) -> Optional[str]:
+    """将可选时间转换为稳定的 ISO 8601 文本。"""
+    return value.isoformat() if value else None
+
+
+def _number(value: Any, default: Optional[float]) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    """Accept dicts as well as RSS item objects returned by older MoviePilot builds."""
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    try:
+        return dict(vars(value))
+    except (TypeError, ValueError):
+        return {}
+
+
+def _value_from_raw(raw: Dict[str, Any], key: str) -> Any:
+    value = raw.get(key)
+    if value not in (None, ""):
+        return value
+    try:
+        return getattr(raw, key)
+    except AttributeError:
+        return None
+
+
+def _enclosure_from_raw(raw: Dict[str, Any]) -> str:
+    """Extract URL from string, RSS enclosure object, or common URL aliases."""
+    value = _value_from_raw(raw, "enclosure")
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("href") or value.get("link")
+    elif isinstance(value, (list, tuple)) and value:
+        first = value[0]
+        value = first.get("url") if isinstance(first, dict) else first
+    if not value:
+        for key in ("download_url", "downloadurl", "torrent_url", "torrenturl", "url", "link", "guid"):
+            candidate = _value_from_raw(raw, key)
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url") or candidate.get("href")
+            if candidate:
+                value = candidate
+                break
+    return str(value or "").strip()
+
+
+def _size_from_text(text: str) -> int:
+    """Read human-readable sizes such as `4.01 GB` from RSS descriptions."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(KiB|KB|MiB|MB|GiB|GB|TiB|TB)\b", cleaned, re.I)
+    if not match:
+        return 0
+    # PT sites generally label binary torrent sizes as KB/MB/GB/TB. Use the
+    # same basis as the rule controls so a displayed 4.01 GB satisfies 4 GB.
+    factors = {"kib": 1024, "kb": 1024, "mib": 1024 ** 2, "mb": 1024 ** 2, "gib": 1024 ** 3, "gb": 1024 ** 3, "tib": 1024 ** 4, "tb": 1024 ** 4}
+    return int(float(match.group(1)) * factors[match.group(2).casefold()])
+
+
+def _pubdate_from_text(text: str, now: Optional[datetime]) -> Optional[datetime]:
+    """Recover publication time when a tracker embeds it only in RSS HTML."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(
+        r"(?:发布时间|發佈時間|发布于|發佈於|published(?:\s+at)?|posted(?:\s+at)?)\s*[:：]?\s*"
+        r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?)",
+        cleaned,
+        re.I,
+    )
+    return parse_datetime(match.group(1).replace("/", "-").replace(".", "-"), now) if match else None
+
+
+def _iter_fields(value: Any, key: str = "") -> Iterable[Tuple[str, Any]]:
+    """递归展开 RSS/Rust 解析器可能返回的嵌套促销字段。"""
+    if isinstance(value, dict):
+        for name, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(name).casefold())
+            yield normalized, child
+            yield from _iter_fields(child, normalized)
+    elif isinstance(value, (list, tuple, set)):
+        for child in value:
+            yield from _iter_fields(child, key)
+    elif key:
+        yield key, value
+
+
+def _field_number(fields: Iterable[Tuple[str, Any]], names: set[str]) -> Optional[float]:
+    """从大小写、下划线和嵌套结构不稳定的字段中读取数字。"""
+    for key, value in fields:
+        if key in names:
+            number = _number(value, None)
+            if number is not None:
+                return number
+    return None
+
+
+def _field_value(fields: Iterable[Tuple[str, Any]], names: set[str]) -> Any:
+    for key, value in fields:
+        if key in names and value not in (None, ""):
+            return value
+    return None
+
+
+def _field_bool(fields: Iterable[Tuple[str, Any]], names: set[str]) -> bool:
+    """读取站点常见的 free/freeleech 布尔字段。"""
+    for key, value in fields:
+        if key not in names:
+            continue
+        if value is True or (isinstance(value, (int, float)) and value == 1):
+            return True
+        if str(value).strip().casefold() in {"true", "yes", "y", "on", "free", "免费", "免費", "1"}:
+            return True
+    return False
