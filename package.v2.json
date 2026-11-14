@@ -3,11 +3,12 @@
     "name": "刷流追新",
     "description": "一个 qBittorrent 统一管理多站点 RSS 追新、最高画质去重、免费期和自动删种。",
     "labels": "站点,RSS,下载管理,qBittorrent",
-    "version": "1.1.26",
+    "version": "1.1.27",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png",
     "author": "Codex",
     "level": 2,
     "history": {
+      "v1.1.27": "修复“显示已添加但 qBittorrent 里没有任务”：改为先用站点Cookie/UA/Referer取回并校验种子，再以字节提交，按infohash确认；取种失败不再提交也不再虚报成功，日志区分“已确认”与“已提交待确认”。",
       "v1.1.26": "V2/V3双宿主兼容导入：所有app.*导入加try/except回退到app.sdk.*，同一份代码可运行在V2和V3宿主。",
       "v1.1.25": "优化运行逻辑：消除 _add_item 中 O(N×M) 全表 normalize、合并双次 match_rule 和三次冗余 normalize_item、用 media_key 预过滤替换全量扫描、复用已计算 url_key、消除 _finish_job 连续 deepcopy、为 CoalescingWriter 加 drain 限次。",
       "v1.1.23": "修复相同季集因副标题中的平台、发布组或说明差异被重复下载；副标题仅用于提取剧名和季集身份，已有完整副本时不再新增同资源任务。",

@@ -99,6 +99,13 @@ def plugin_module(monkeypatch):
     monkeypatch.syspath_prepend(str(package_root))
     sys.modules.pop("brushflowtracker", None)
     loaded = import_module("brushflowtracker")
+
+    def offline_torrent(url, auth=None, timeout=20, proxies=None, mode="auto"):
+        """契约测试不做网络抓取：沿用 URL 提交，不验证真实种子内容。"""
+        return {"content": str(url), "hashes": [], "name": "", "size": 0,
+                "transport": "url", "cookie": ""}
+
+    monkeypatch.setattr(loaded, "prepare_torrent", offline_torrent)
     yield loaded
     for name in list(sys.modules):
         if name == "brushflowtracker" or name.startswith("brushflowtracker."):

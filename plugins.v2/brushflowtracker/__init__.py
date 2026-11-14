@@ -67,6 +67,7 @@ from .core import (
 from .models import DownloaderTestPayload, RunPayload, SettingsPayload
 from .persistence import CoalescingWriter
 from .snapshots import BatchTorrentView
+from .torrent_transport import TorrentTransportError, prepare_torrent
 
 
 class _CustomQBAdapter:
@@ -152,7 +153,7 @@ class BrushFlowTracker(_PluginBase):
     plugin_name = "刷流追新"
     plugin_desc = "多站点 RSS 选种、最高画质去重、免费期监控与顺序删种"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/seed.png"
-    plugin_version = "1.1.26"
+    plugin_version = "1.1.27"
     plugin_author = "Codex"
     author_url = "https://github.com/openai"
     plugin_config_prefix = "brushflowtracker_"
@@ -756,7 +757,8 @@ class BrushFlowTracker(_PluginBase):
                         self._state["processed_urls"][url_key] = isoformat(now)
                     else:
                         result["add_failed"] += 1
-                        self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
+                        self._log_selection(site, rule, item, "失败",
+                                            "未提交 qBittorrent（获取种子或添加失败，详见上一条日志）")
             except Exception as err:
                 result["rule_errors"] += 1
                 logger.error(f"刷流追新站点 [{site['name']}] 规则 [{rule.get('name')}] 失败：{str(err)}")
@@ -1357,7 +1359,8 @@ class BrushFlowTracker(_PluginBase):
             else:
                 result["add_failed"] += 1
                 record.get("site_result", Counter())["add_failed"] += 1
-                self._log_selection(site, rule, item, "失败", "qBittorrent 添加失败")
+                self._log_selection(site, rule, item, "失败",
+                                    "未提交 qBittorrent（获取种子或添加失败，详见上一条日志）")
         return result
 
     def _fetch_detail_promotion(self, site: Dict[str, Any], raw: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
@@ -1431,6 +1434,72 @@ class BrushFlowTracker(_PluginBase):
                 from app.sdk.config import settings  # type: ignore
             return settings.PROXY
         except Exception:
+            return None
+
+    def _site_auth_context(
+        self, site: Dict[str, Any], rule: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """站点认证只用于 RSS 同源请求；跨域链接不会收到 Cookie 或 passkey。"""
+        rss_url = str((rule or {}).get("url") or "").strip()
+        probe = rss_url or str(site.get("referer") or "").strip()
+        domain = (urlsplit(probe).hostname or "").lower() if probe else ""
+        cache = getattr(self, "_site_auth_cache", {})
+        cache_key = (
+            domain, str(site.get("cookie") or ""), str(site.get("uid") or ""),
+            str(site.get("passkey") or ""), str(site.get("user_agent") or ""),
+            str(site.get("use_proxy")),
+        )
+        cached = cache.get(cache_key)
+        if cached is None:
+            configured = None
+            if domain:
+                try:
+                    try:
+                        from app.db.site_oper import SiteOper
+                    except ImportError:
+                        from app.sdk.services import SiteOper  # type: ignore
+                    configured = SiteOper().get_by_domain(domain)
+                except Exception:
+                    configured = None
+            cached = (
+                site.get("cookie") or getattr(configured, "cookie", None),
+                site.get("user_agent") or getattr(configured, "ua", None),
+                bool(site.get("use_proxy")) if "use_proxy" in site
+                else bool(getattr(configured, "proxy", False)),
+            )
+            cache[cache_key] = cached
+            self._site_auth_cache = cache
+        cookie, ua, use_proxy = cached
+        referer = str(site.get("referer") or "").strip()
+        if not referer and probe:
+            parts = urlsplit(probe)
+            referer = f"{parts.scheme}://{parts.netloc}/" if parts.scheme else ""
+        return {
+            "url": rss_url or referer,
+            "cookie": str(cookie or ""),
+            "user_agent": str(ua or ""),
+            "referer": referer,
+            "uid": str(site.get("uid") or ""),
+            "passkey": str(site.get("passkey") or ""),
+            "proxies": self._proxy_config() if use_proxy else None,
+        }
+
+    def _prepare_torrent(
+        self, site: Dict[str, Any], rule: Dict[str, Any], item: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """先取得并校验种子，再交给 qB；qB 的按 URL 添加会异步失败且仍回 Ok."""
+        auth = self._site_auth_context(site, rule)
+        proxies = auth.pop("proxies", None)
+        link = str(item.get("enclosure") or item.get("link") or "").strip()
+        try:
+            return prepare_torrent(
+                link, auth, timeout=self._request_timeout_seconds, proxies=proxies
+            )
+        except TorrentTransportError as error:
+            self._log_selection(site, rule, item, "排除", f"获取种子失败：{error}")
+            logger.warning(
+                f"刷流追新未能取得有效种子，未提交 qBittorrent：{item.get('title')} | {error}"
+            )
             return None
 
     @staticmethod
@@ -1545,13 +1614,21 @@ class BrushFlowTracker(_PluginBase):
                 if record:
                     record.update(self._identity_fields(self._managed_item(record, torrent)))
         inferior_hashes = self._inferior_managed_hashes(site["id"], item) if self._highest_resolution_dedup else []
-        success, torrent_ids = service.instance.add_torrent(content=item["enclosure"], tag=task_name)
+        prepared = self._prepare_torrent(site, rule, item)
+        if prepared is None:
+            # qB 按 URL 添加会先回 Ok. 再异步抓取；抓取失败时任务不会出现。
+            # 先自行取回并校验种子，失败就不提交，避免“已添加但 qB 里没有”。
+            return False
+        expected_hashes = [str(value).lower() for value in prepared.get("hashes") or [] if value]
+        success, torrent_ids = service.instance.add_torrent(content=prepared["content"], tag=task_name)
         if not success:
+            logger.warning(f"刷流追新 qBittorrent 拒绝添加：{item['title']}")
             return False
         hashes = [str(value).lower() for value in torrent_ids or [] if value]
         if not hashes:
             hashes = self._find_added_hashes(
-                service, task_name, item["title"], existing_hashes=existing_hashes
+                service, task_name, item["title"],
+                existing_hashes=existing_hashes, expected_hashes=expected_hashes,
             )
         now = datetime.now().astimezone()
         url_key = str(item.get("url_key") or "") or hashlib.sha1(item["enclosure"].encode("utf-8")).hexdigest()
@@ -1596,14 +1673,21 @@ class BrushFlowTracker(_PluginBase):
                 "url_key": url_key,
                 "confirm_attempts": 0,
                 "existing_hashes": sorted(existing_hashes or []),
+                "expected_hashes": expected_hashes,
                 "replace_hashes": replace_hashes,
             })
-        self._append_history({**record, "event": "added", "torrent_hashes": hashes})
+        self._append_history({**record, "event": "added", "torrent_hashes": hashes,
+                              "confirmed": bool(hashes)})
         if replace_hashes and hashes:
             logger.info(f"刷流追新已登记升级关系，等待新版本完成后再删除：{item['title']}")
         if item["promotion"] != "normal" and not item.get("free_until"):
             logger.warning(f"刷流追新已添加免费种但无法识别截止时间：{item['title']}")
-        logger.info(f"刷流追新已添加：[{site['name']}] {item['title']} ({item['resolution']})")
+        if hashes:
+            logger.info(f"刷流追新已添加并确认：[{site['name']}] {item['title']} ({item['resolution']})")
+        else:
+            logger.info(
+                f"刷流追新已提交 qBittorrent，等待任务出现后确认：[{site['name']}] {item['title']}"
+            )
         return True
 
     def _log_selection(
@@ -1720,6 +1804,7 @@ class BrushFlowTracker(_PluginBase):
         task_name: str,
         title: str,
         existing_hashes: Optional[set] = None,
+        expected_hashes: Optional[List[str]] = None,
     ) -> List[str]:
         if isinstance(service.instance, BatchTorrentView):
             return []  # One real refresh after the whole batch handles pending rows.
@@ -1728,6 +1813,13 @@ class BrushFlowTracker(_PluginBase):
         torrents, failed = service.instance.get_torrents()
         if failed:
             return []
+        present = {
+            str(row.get("hash") or "").lower() for row in torrents or [] if row.get("hash")
+        }
+        expected = [value for value in (expected_hashes or []) if value in present]
+        if expected:
+            # 元数据里算出的 infohash 是确定的身份，优先于名称/标签猜测。
+            return expected[:1]
         matches = []
         for item in torrents or []:
             torrent_hash = str(item.get("hash") or "").lower()
@@ -1886,7 +1978,16 @@ class BrushFlowTracker(_PluginBase):
                 str(value).lower() for value in record.get("existing_hashes") or [] if value
             }
             matched_hash = None
-            for item in torrents or []:
+            expected = {
+                str(value).lower() for value in record.get("expected_hashes") or [] if value
+            }
+            if expected:
+                for item in torrents or []:
+                    torrent_hash = str(item.get("hash") or "").lower()
+                    if torrent_hash and torrent_hash in expected and torrent_hash not in claimed:
+                        matched_hash = torrent_hash
+                        break
+            for item in (torrents or []) if not matched_hash else []:
                 torrent_hash = str(item.get("hash") or "").lower()
                 if not torrent_hash or torrent_hash in existing_hashes or torrent_hash in claimed:
                     continue
@@ -1898,7 +1999,7 @@ class BrushFlowTracker(_PluginBase):
                         break
             if matched_hash:
                 managed_record = dict(record)
-                for key in ("existing_hashes", "confirm_attempts", "last_confirm_at"):
+                for key in ("existing_hashes", "confirm_attempts", "last_confirm_at", "expected_hashes"):
                     managed_record.pop(key, None)
                 self._state["managed"][matched_hash] = managed_record
                 self._state.setdefault("deleted_hashes", {}).pop(matched_hash, None)
